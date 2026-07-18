@@ -12,6 +12,7 @@ from qbx.debrid.manager import ReadyFile, ReadyFileResult
 from qbx.engine.interceptor import Interceptor
 from qbx.engine.metadata import (
     MetadataHandoffError,
+    _assert_public_http_url,
     ensure_qbt_metadata,
     fetch_torrent_bytes,
     infohash_v1_from_torrent,
@@ -235,6 +236,8 @@ async def test_ensure_hash_mismatch_fails(monkeypatch):
             emit=lambda kind, msg, **kw: events.append(kind),
         )
     assert "metadata.handoff.failed" in events
+
+
 async def test_fetch_torrent_bytes_cache_hit(monkeypatch):
     content, h = make_torrent_bytes()
 
@@ -497,3 +500,133 @@ async def test_wait_for_metadata_timeout(monkeypatch):
             await client.wait_for_metadata("abc", timeout_seconds=0.05, poll_seconds=0.01)
     finally:
         await client.aclose()
+
+
+def test_assert_public_http_url_blocks_loopback_and_link_local():
+    with pytest.raises(MetadataHandoffError, match="blocked"):
+        _assert_public_http_url("http://127.0.0.1/x.torrent")
+    with pytest.raises(MetadataHandoffError, match="blocked"):
+        _assert_public_http_url("http://[::1]/x.torrent")
+    with pytest.raises(MetadataHandoffError, match="blocked"):
+        _assert_public_http_url("http://169.254.169.254/latest")
+    with pytest.raises(MetadataHandoffError, match="blocked"):
+        _assert_public_http_url("http://metadata.google.internal/")
+    # Operator LAN caches remain allowed.
+    _assert_public_http_url("http://192.168.4.23:18099/h.torrent")
+
+
+async def test_fetch_rejects_redirect_to_loopback(monkeypatch):
+    content, h = make_torrent_bytes()
+
+    class FakeResp:
+        def __init__(self, status_code, headers=None):
+            self.status_code = status_code
+            self.headers = headers or {}
+
+        async def aiter_bytes(self):
+            if False:  # pragma: no cover
+                yield b""
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def get(self, url, timeout=None):
+            if "evil.example" in url:
+                return FakeResp(302, {"location": "http://127.0.0.1/secret.torrent"})
+            raise AssertionError(f"unexpected get {url}")
+
+    monkeypatch.setattr("qbx.engine.metadata.httpx.AsyncClient", FakeClient)
+    with pytest.raises(MetadataHandoffError, match="blocked|cache miss"):
+        await fetch_torrent_bytes(
+            h,
+            [f"https://evil.example/{{hash}}.torrent"],
+            AnonymityConfig(enabled=False),
+            timeout_seconds=5,
+        )
+
+
+async def test_ensure_skips_magnet_restore_when_torrent_lingers(monkeypatch):
+    content, h = make_torrent_bytes()
+    restored: list[str] = []
+
+    class FakeQbt:
+        def __init__(self):
+            self._t = {
+                "hash": h,
+                "name": "x",
+                "state": "metaDL",
+                "total_size": -1,
+                "magnet_uri": f"magnet:?xt=urn:btih:{h}",
+                "save_path": "/tmp",
+                "category": "",
+                "tags": "",
+            }
+
+        async def files(self, torrent_hash):
+            return []
+
+        async def torrents(self, **kwargs):
+            return [dict(self._t)]
+
+        async def parse_metadata(self, blob, filename="file.torrent"):
+            return {"infohash_v1": h, "id": h}
+
+        async def delete(self, hashes, delete_files=False):
+            self._t["state"] = "checkingResumeData"
+            self._t["total_size"] = 1024
+
+        async def add_torrent_file(self, *a, **k):
+            return None
+
+        async def wait_for_metadata(self, *a, **k):
+            raise QbtError("timed out waiting for metadata")
+
+        async def add_magnet(self, magnet, **kwargs):
+            restored.append(magnet)
+
+    async def fake_fetch(*a, **k):
+        return content, h
+
+    async def fake_gone(*a, **k):
+        return None
+
+    monkeypatch.setattr("qbx.engine.metadata.fetch_torrent_bytes", fake_fetch)
+    monkeypatch.setattr("qbx.engine.metadata._wait_until_gone", fake_gone)
+    with pytest.raises(MetadataHandoffError, match="still present"):
+        await ensure_qbt_metadata(
+            FakeQbt(),
+            {
+                "hash": h,
+                "name": "x",
+                "state": "metaDL",
+                "total_size": -1,
+                "magnet_uri": f"magnet:?xt=urn:btih:{h}",
+                "save_path": "/tmp",
+                "tags": "",
+                "category": "",
+            },
+        )
+    assert restored == []
+
+
+async def test_ready_requires_files_not_just_total_size():
+    """Stale total_size without a file tree must not short-circuit handoff."""
+    content, h = make_torrent_bytes()
+
+    class FakeQbt:
+        async def files(self, torrent_hash):
+            return []
+
+        async def torrents(self, **kwargs):
+            return [{"hash": h, "state": "checkingResumeData", "total_size": 999}]
+
+    from qbx.engine.metadata import _ready_torrent_row
+
+    assert await _ready_torrent_row(FakeQbt(), h, unknown_as_error=False) is None
