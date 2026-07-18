@@ -1,0 +1,47 @@
+services:
+  qbx:
+    build: .
+    image: qbx:latest
+    container_name: qbx
+    restart: unless-stopped
+    ports:
+      - "${QBX_PORT:-8484}:8484"
+    volumes:
+      - qbx-config:/config
+      # Map this to where you want debrid downloads to land on the host.
+      - ${QBX_DOWNLOADS:-./downloads}:/downloads
+    environment:
+      QBX_CONFIG_DIR: /config
+      # Bind is also set via CMD; these seed server.* on first boot into config.toml.
+      QBX_SERVER__HOST: "0.0.0.0"
+      QBX_SERVER__PORT: "8484"
+      QBX_SERVER__LOG_LEVEL: "${QBX_SERVER__LOG_LEVEL:-INFO}"
+
+      # qBittorrent (use host.docker.internal when qBT runs on the Docker host)
+      QBX_QBT__URL: "${QBX_QBT__URL:-http://host.docker.internal:8080}"
+      QBX_QBT__USERNAME: "${QBX_QBT__USERNAME:-admin}"
+      QBX_QBT__PASSWORD: "${QBX_QBT__PASSWORD:-}"
+      QBX_QBT__VERIFY_TLS: "${QBX_QBT__VERIFY_TLS:-true}"
+
+      # Debrid providers (optional — also configurable in Control Shell → Settings)
+      QBX_ALLDEBRID_API_KEY: "${QBX_ALLDEBRID_API_KEY:-}"
+      QBX_REALDEBRID_API_KEY: "${QBX_REALDEBRID_API_KEY:-}"
+      # Optional: QBX_ALLDEBRID_ENABLED, QBX_ALLDEBRID_PRIORITY, QBX_REALDEBRID_* (see .env.example)
+
+      # Proxy / anonymity
+      QBX_ANONYMITY__ENABLED: "${QBX_ANONYMITY__ENABLED:-true}"
+      QBX_ANONYMITY__PROXY_URL: "${QBX_ANONYMITY__PROXY_URL:-}"
+      QBX_ANONYMITY__USE_PROXY_FOR_DEBRID: "${QBX_ANONYMITY__USE_PROXY_FOR_DEBRID:-true}"
+      QBX_ANONYMITY__USE_PROXY_FOR_DOWNLOADS: "${QBX_ANONYMITY__USE_PROXY_FOR_DOWNLOADS:-true}"
+
+      # Interceptor
+      QBX_INTERCEPTOR__DELIVERY_MODE: "${QBX_INTERCEPTOR__DELIVERY_MODE:-webseed}"
+      QBX_INTERCEPTOR__DOWNLOAD_DIR: "${QBX_INTERCEPTOR__DOWNLOAD_DIR:-/downloads}"
+      QBX_INTERCEPTOR__STALLED_ONLY: "${QBX_INTERCEPTOR__STALLED_ONLY:-true}"
+    # If qBittorrent runs on the host, this lets the container reach it via
+    # http://host.docker.internal:8080 (Linux needs the extra_hosts entry).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  qbx-config:

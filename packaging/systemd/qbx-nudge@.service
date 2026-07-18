@@ -1,0 +1,13 @@
+[Unit]
+Description=qbx policy nudge for torrent %i
+After=qbx.service
+Requires=qbx.service
+
+[Service]
+Type=oneshot
+User=qbx
+Group=qbx
+EnvironmentFile=-/etc/qbx/qbx.env
+Environment=QBX_CONFIG_DIR=/var/lib/qbx
+# %i is the torrent infohash from qBittorrent's external program substitution.
+ExecStart=/usr/bin/qbx nudge --hash %i

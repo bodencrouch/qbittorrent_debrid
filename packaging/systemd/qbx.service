@@ -1,0 +1,22 @@
+[Unit]
+Description=qbx debrid companion for qBittorrent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=qbx
+Group=qbx
+EnvironmentFile=-/etc/qbx/qbx.env
+Environment=QBX_CONFIG_DIR=/var/lib/qbx
+ExecStart=/usr/bin/qbx serve
+Restart=on-failure
+RestartSec=5
+# Harden a bit without breaking local WebUI access.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/qbx /etc/qbx
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+vendor/
+qbx/web/matcher/node_modules/
+qbx/web/matcher/dist/
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.env
+.env.local
+
+# Local / agent artifacts (not part of the package)
+$tmpdir/
+agentdecompile_projects/
+.playwright-mcp/
+.cursor/
+qbx-browser-proof*.png
+qbx-playwright*.png

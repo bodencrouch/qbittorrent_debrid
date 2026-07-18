@@ -1,0 +1,69 @@
+# Provisional defaults for qbx (copy to $QBX_CONFIG_DIR/config.provisional.yaml).
+# Override order (later wins):
+#   code defaults < this file < env/CLI < config.toml (WebUI / qbx setup)
+
+interceptor:
+  enabled: true
+  delivery_mode: webseed
+  stalled_only: true
+  stalled_min_minutes: 30
+  min_stalled_seeds: 1
+  max_stalled_download_speed: 1024
+  max_stalled_availability: 0.1
+  max_debrid_per_scan: 3
+  stalled_queue_confirmation_passes: 2
+  fallback_to_torrent: true
+  reannounce_before_debrid: true
+  metadata_handoff: true
+  # metadata_sources:
+  #   - "https://itorrents.org/torrent/{hash}.torrent"
+  #   - "https://torrage.info/torrent.php?h={hash}"
+  # metadata_fetch_timeout_seconds: 30
+  # metadata_wait_seconds: 120
+
+matcher:
+  enabled: false
+  auto_placement: false
+  run_on_add: true
+  run_after_debrid: false
+  folders: []
+  interval_minutes: 60
+  require_same_extension: true
+  skip_unmatched: false
+  recheck: true
+  max_torrents_per_pass: 25
+  # max_hash_bytes_per_pass: 8589934592  # 8 GiB
+  max_rechecks_per_pass: 10
+  allow_cross_device_copy: false
+
+# Title-similarity dedup (NOT same infohash — qBT already blocks that).
+# Default off so parallel releases / cross-seed libraries stay active.
+# duplicates:
+#   enabled: false
+#   action: tag   # tag | pause | delete
+#   min_title_similarity: 0.92
+
+server:
+  host: 127.0.0.1
+  port: 8484
+  log_level: INFO
+
+anonymity:
+  enabled: true
+  proxy_url: ""
+  use_proxy_for_debrid: true
+  use_proxy_for_downloads: true
+  random_user_agent: true
+  strip_trackers: true
+
+# Providers are usually set via WebUI Settings, env (QBX_*_API_KEY), or CLI.
+# Uncomment to seed provisional defaults:
+# providers:
+#   - name: alldebrid
+#     enabled: false
+#     priority: 0
+#     api_key: ""
+#   - name: realdebrid
+#     enabled: false
+#     priority: 1
+#     api_key: ""

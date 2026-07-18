@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qbx"
+version = "0.1.0"
+description = "qbx - a debrid-first automation extension for qBittorrent (Real-Debrid / AllDebrid, duplicate management, file matching, light *arr automation)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "qbx contributors" }]
+keywords = ["qbittorrent", "real-debrid", "alldebrid", "torrent", "automation"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Framework :: FastAPI",
+    "Topic :: Communications :: File Sharing",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "httpx[socks]>=0.27",
+    "pydantic>=2.6",
+    "cryptography>=42.0",
+    "tomli>=2.0; python_version < '3.11'",
+    "tomli-w>=1.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+]
+
+[project.scripts]
+qbx = "qbx.cli:main"
+
+[project.urls]
+Homepage = "https://example.invalid/qbx"
+
+[tool.hatch.build.targets.wheel]
+packages = ["qbx"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"qbx/web" = "qbx/web"
+
+[tool.hatch.build.targets.sdist]
+include = ["qbx", "tests", "README.md", "pyproject.toml", "packaging"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
