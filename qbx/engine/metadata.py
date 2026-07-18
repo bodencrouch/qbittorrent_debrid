@@ -13,8 +13,8 @@ import ipaddress
 import logging
 import re
 import time
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, NoReturn
 from urllib.parse import parse_qsl, quote, urlsplit
 
 import httpx
@@ -101,29 +101,30 @@ async def _ready_torrent_row(
     """
     try:
         files = await qbt.files(torrent_hash)
-        if files:
-            try:
-                rows = await qbt.torrents(hashes=torrent_hash)
-            except Exception as exc:
-                if unknown_as_error:
-                    raise MetadataHandoffError(f"qBittorrent unreachable: {exc}") from exc
-                return {"hash": torrent_hash}
-            return rows[0] if rows else {"hash": torrent_hash}
     except MetadataHandoffError:
         raise
     except Exception as exc:
         if unknown_as_error and isinstance(exc, QbtError):
             raise MetadataHandoffError(f"qBittorrent unreachable: {exc}") from exc
         log.debug("files() failed while checking metadata for %s", torrent_hash, exc_info=True)
+        if not unknown_as_error:
+            return None
+        # Probe reachability when files() failed soft but we must fail closed.
+        try:
+            await qbt.torrents(hashes=torrent_hash)
+        except Exception as probe_exc:
+            raise MetadataHandoffError(f"qBittorrent unreachable: {probe_exc}") from probe_exc
+        return None
+
+    if not files:
+        return None
     try:
         rows = await qbt.torrents(hashes=torrent_hash)
     except Exception as exc:
         if unknown_as_error:
             raise MetadataHandoffError(f"qBittorrent unreachable: {exc}") from exc
-        return None
-    # Never treat "not metaDL / total_size set" alone as ready — empty files() means
-    # the piece map is still missing (e.g. checkingResumeData with a stale size hint).
-    return None
+        return {"hash": torrent_hash}
+    return rows[0] if rows else {"hash": torrent_hash}
 
 
 def infohash_v1_from_torrent(content: bytes) -> str:
@@ -226,11 +227,7 @@ _hash_locks_guard = asyncio.Lock()
 async def _lock_for_hash(torrent_hash: str) -> asyncio.Lock:
     """Return a process-local lock so concurrent handoffs for one hash serialize."""
     async with _hash_locks_guard:
-        lock = _hash_locks.get(torrent_hash)
-        if lock is None:
-            lock = asyncio.Lock()
-            _hash_locks[torrent_hash] = lock
-        return lock
+        return _hash_locks.setdefault(torrent_hash, asyncio.Lock())
 
 
 async def fetch_torrent_bytes(
@@ -405,8 +402,8 @@ async def _ensure_qbt_metadata_locked(
 ) -> dict:
     h = torrent_hash
     name = str(torrent.get("name") or h)
-    want = h
     source_list = list(sources) if sources else list(DEFAULT_METADATA_SOURCES)
+    save_path, category, tags = _torrent_placement(torrent)
 
     def _emit(kind: str, message: str, **data: Any) -> None:
         if emit is None:
@@ -417,6 +414,10 @@ async def _ensure_qbt_metadata_locked(
         except Exception:
             log.debug("metadata emit failed for %s", kind, exc_info=True)
 
+    def _fail(err: MetadataHandoffError, cause: BaseException, **data: Any) -> NoReturn:
+        _emit("metadata.handoff.failed", f"Metadata handoff failed: {err}", error=str(err), **data)
+        raise err from cause
+
     # Metadata may have arrived since the last sync snapshot (or while waiting
     # for this lock after another handoff finished).
     ready = await _ready_torrent_row(qbt, h, unknown_as_error=True)
@@ -426,9 +427,6 @@ async def _ensure_qbt_metadata_locked(
     magnet = magnet_for(torrent)
     if not magnet or not _magnet_infohash(magnet):
         raise MetadataHandoffError("no restorable magnet; refusing destructive handoff")
-    save_path = torrent.get("save_path") or torrent.get("savePath") or None
-    category = torrent.get("category") or None
-    tags = (torrent.get("tags") or "").strip() or None
 
     deleted = False
     _emit("metadata.handoff.start", f"Fetching torrent metadata for '{name}'")
@@ -440,7 +438,7 @@ async def _ensure_qbt_metadata_locked(
             timeout_seconds=fetch_timeout_seconds,
         )
         # Fail closed: local SHA1 and qBT parseMetadata must both agree.
-        if len(want) == 40 and local_v1 != want:
+        if len(h) == 40 and local_v1 != h:
             raise MetadataHandoffError(
                 f"torrent hash mismatch for {h} (cache infohash_v1={local_v1})"
             )
@@ -483,12 +481,7 @@ async def _ensure_qbt_metadata_locked(
         )
         return refreshed
     except Exception as exc:
-        if isinstance(exc, MetadataHandoffError):
-            err = exc
-        elif isinstance(exc, QbtError):
-            err = MetadataHandoffError(str(exc))
-        else:
-            err = MetadataHandoffError(repr(exc))
+        err = _as_handoff_error(exc)
 
         if deleted:
             # Re-add may have succeeded even if wait timed out — treat as success.
@@ -509,18 +502,15 @@ async def _ensure_qbt_metadata_locked(
             except Exception:
                 lingering = []
             if lingering:
-                err = MetadataHandoffError(
-                    f"{err}; torrent still present without usable metadata"
-                )
-                _emit(
-                    "metadata.handoff.failed",
-                    f"Metadata handoff failed: {err}",
-                    error=str(err),
+                _fail(
+                    MetadataHandoffError(
+                        f"{err}; torrent still present without usable metadata"
+                    ),
+                    exc,
                     deleted=True,
                     restored=False,
                     lingering=True,
                 )
-                raise err from exc
             restored = await _restore_magnet(
                 qbt,
                 magnet,
@@ -529,17 +519,14 @@ async def _ensure_qbt_metadata_locked(
                 tags=tags,
             )
             if not restored:
-                err = MetadataHandoffError(
-                    f"{err}; magnet restore also failed (torrent may be missing)"
-                )
-                _emit(
-                    "metadata.handoff.failed",
-                    f"Metadata handoff failed: {err}",
-                    error=str(err),
+                _fail(
+                    MetadataHandoffError(
+                        f"{err}; magnet restore also failed (torrent may be missing)"
+                    ),
+                    exc,
                     deleted=True,
                     restored=False,
                 )
-                raise err from exc
             # Handoff still failed (caller must not inject webseeds), but the magnet
             # is back so the user is not left with a deleted torrent.
             _emit(
@@ -551,8 +538,39 @@ async def _ensure_qbt_metadata_locked(
             )
             raise err from exc
 
-        _emit("metadata.handoff.failed", f"Metadata handoff failed: {err}", error=str(err))
-        raise err from exc
+        _fail(err, exc)
+
+
+def _torrent_placement(torrent: dict) -> tuple[str | None, str | None, str | None]:
+    save_path = torrent.get("save_path") or torrent.get("savePath") or None
+    category = torrent.get("category") or None
+    tags = (torrent.get("tags") or "").strip() or None
+    return save_path, category, tags
+
+
+def _as_handoff_error(exc: BaseException) -> MetadataHandoffError:
+    if isinstance(exc, MetadataHandoffError):
+        return exc
+    if isinstance(exc, QbtError):
+        return MetadataHandoffError(str(exc))
+    return MetadataHandoffError(repr(exc))
+
+
+async def _retry_async(
+    op: Callable[[], Awaitable[Any]],
+    *,
+    attempts: int = 4,
+) -> Any:
+    """Retry an awaitable factory with linear backoff."""
+    last_exc: Exception | None = None
+    for i in range(attempts):
+        try:
+            return await op()
+        except Exception as exc:
+            last_exc = exc
+            await asyncio.sleep(0.35 * (i + 1))
+    assert last_exc is not None
+    raise last_exc
 
 
 async def _wait_until_gone(qbt: Any, torrent_hash: str, *, timeout_seconds: float = 30.0) -> None:
@@ -586,23 +604,17 @@ async def _add_torrent_with_retry(
     tags: str | None,
     attempts: int = 4,
 ) -> None:
-    last_exc: Exception | None = None
-    for i in range(attempts):
-        try:
-            await qbt.add_torrent_file(
-                content,
-                filename,
-                category=category,
-                save_path=save_path,
-                paused=True,
-                tags=tags,
-            )
-            return
-        except Exception as exc:
-            last_exc = exc
-            await asyncio.sleep(0.35 * (i + 1))
-    assert last_exc is not None
-    raise last_exc
+    async def _once() -> None:
+        await qbt.add_torrent_file(
+            content,
+            filename,
+            category=category,
+            save_path=save_path,
+            paused=True,
+            tags=tags,
+        )
+
+    await _retry_async(_once, attempts=attempts)
 
 
 async def _restore_magnet(
@@ -616,26 +628,26 @@ async def _restore_magnet(
 ) -> bool:
     if not magnet or not _magnet_infohash(magnet):
         return False
-    last_exc: Exception | None = None
-    for i in range(attempts):
-        try:
-            await qbt.add_magnet(
-                magnet,
-                category=category,
-                save_path=save_path,
-                paused=True,
-                tags=tags,
-            )
-            log.warning("restored magnet after failed metadata handoff")
-            return True
-        except Exception as exc:
-            last_exc = exc
-            await asyncio.sleep(0.35 * (i + 1))
-    log.error(
-        "failed to restore magnet after metadata handoff failure: %s",
-        last_exc,
-    )
-    return False
+
+    async def _once() -> None:
+        await qbt.add_magnet(
+            magnet,
+            category=category,
+            save_path=save_path,
+            paused=True,
+            tags=tags,
+        )
+
+    try:
+        await _retry_async(_once, attempts=attempts)
+    except Exception as last_exc:
+        log.error(
+            "failed to restore magnet after metadata handoff failure: %s",
+            last_exc,
+        )
+        return False
+    log.warning("restored magnet after failed metadata handoff")
+    return True
 
 
 async def _refresh_torrent(qbt: Any, torrent_hash: str, *, fallback: dict | None) -> dict:
