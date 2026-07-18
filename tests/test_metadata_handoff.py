@@ -59,6 +59,95 @@ def test_metadata_matches_hash():
     assert metadata_matches_hash({"infohash_v1": "AbC"}, "abc")
     assert metadata_matches_hash({"id": "deadbeef"}, "deadbeef")
     assert not metadata_matches_hash({"infohash_v1": "aaaa"}, "bbbb")
+    full_a = "a" * 40
+    # Exact match only — truncated / shared-prefix forms must not pass.
+    assert metadata_matches_hash({"infohash_v1": full_a}, full_a)
+    assert not metadata_matches_hash({"infohash_v1": full_a}, full_a[:32])
+    assert not metadata_matches_hash({"infohash_v1": full_a}, ("a" * 32) + ("b" * 8))
+
+
+async def test_ensure_qbt_metadata_serializes_per_hash(monkeypatch):
+    """Interceptor + resolve must not interleave delete/re-add for one hash."""
+    import asyncio
+
+    content, h = make_torrent_bytes()
+    deletes: list[float] = []
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    class FakeQbt:
+        def __init__(self):
+            self._present = True
+            self._files: list[dict] = []
+            self._t = {
+                "hash": h,
+                "name": "x",
+                "state": "metaDL",
+                "total_size": -1,
+                "magnet_uri": f"magnet:?xt=urn:btih:{h}",
+                "save_path": "/tmp",
+                "category": "",
+                "tags": "",
+            }
+
+        async def files(self, torrent_hash):
+            return list(self._files)
+
+        async def torrents(self, **kwargs):
+            return [dict(self._t)] if self._present else []
+
+        async def parse_metadata(self, blob, filename="file.torrent"):
+            return {"infohash_v1": h, "id": h}
+
+        async def delete(self, hashes, delete_files=False):
+            deletes.append(asyncio.get_running_loop().time())
+            entered.set()
+            await gate.wait()
+            self._present = False
+
+        async def add_torrent_file(self, *a, **k):
+            self._present = True
+            self._files = [{"name": "file.mkv"}]
+            self._t["state"] = "pausedDL"
+            self._t["total_size"] = 1024
+
+        async def wait_for_metadata(self, *a, **k):
+            return None
+
+    async def fake_fetch(*a, **k):
+        return content, h
+
+    async def fake_gone(*a, **k):
+        return None
+
+    monkeypatch.setattr("qbx.engine.metadata.fetch_torrent_bytes", fake_fetch)
+    monkeypatch.setattr("qbx.engine.metadata._wait_until_gone", fake_gone)
+
+    qbt = FakeQbt()
+    torrent = {
+        "hash": h,
+        "name": "x",
+        "state": "metaDL",
+        "total_size": -1,
+        "magnet_uri": f"magnet:?xt=urn:btih:{h}",
+        "save_path": "/tmp",
+        "tags": "",
+        "category": "",
+    }
+
+    async def run_one():
+        return await ensure_qbt_metadata(qbt, dict(torrent), enabled=True)
+
+    t1 = asyncio.create_task(run_one())
+    await entered.wait()
+    t2 = asyncio.create_task(run_one())
+    await asyncio.sleep(0.05)
+    assert len(deletes) == 1  # second caller blocked before delete
+    gate.set()
+    out1, out2 = await asyncio.gather(t1, t2)
+    assert out1.get("hash") == h
+    assert out2.get("hash") == h
+    assert len(deletes) == 1
 
 
 async def test_ensure_qbt_metadata_noop_when_has_metadata():

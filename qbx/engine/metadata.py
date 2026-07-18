@@ -214,14 +214,23 @@ def metadata_matches_hash(meta: dict, expected_hash: str) -> bool:
     ]
     for c in candidates:
         got = _normalize_hash(str(c) if c is not None else "")
-        if not got:
-            continue
-        if got == want:
-            return True
-        # Truncated magnet / torrent-id forms (v2): require a long shared prefix.
-        if len(want) >= 32 and len(got) >= 32 and (got.startswith(want) or want.startswith(got)):
+        if got and got == want:
             return True
     return False
+
+
+_hash_locks: dict[str, asyncio.Lock] = {}
+_hash_locks_guard = asyncio.Lock()
+
+
+async def _lock_for_hash(torrent_hash: str) -> asyncio.Lock:
+    """Return a process-local lock so concurrent handoffs for one hash serialize."""
+    async with _hash_locks_guard:
+        lock = _hash_locks.get(torrent_hash)
+        if lock is None:
+            lock = asyncio.Lock()
+            _hash_locks[torrent_hash] = lock
+        return lock
 
 
 async def fetch_torrent_bytes(
@@ -362,11 +371,39 @@ async def ensure_qbt_metadata(
     """Fetch metadata and re-add the torrent when qBittorrent lacks a file tree.
 
     Returns the refreshed torrent dict (possibly same object when no-op).
+    Concurrent callers for the same infohash are serialized so delete/re-add
+    cycles from the interceptor and Control Shell cannot interleave.
     """
     if not enabled or not torrent_needs_metadata(torrent):
         return torrent
 
     h = _require_infohash(str(torrent.get("hash") or ""))
+    lock = await _lock_for_hash(h)
+    async with lock:
+        return await _ensure_qbt_metadata_locked(
+            qbt,
+            torrent,
+            torrent_hash=h,
+            sources=sources,
+            fetch_timeout_seconds=fetch_timeout_seconds,
+            wait_seconds=wait_seconds,
+            anonymity=anonymity,
+            emit=emit,
+        )
+
+
+async def _ensure_qbt_metadata_locked(
+    qbt: Any,
+    torrent: dict,
+    *,
+    torrent_hash: str,
+    sources: list[str] | None,
+    fetch_timeout_seconds: float,
+    wait_seconds: float,
+    anonymity: AnonymityConfig | None,
+    emit: EmitFn | None,
+) -> dict:
+    h = torrent_hash
     name = str(torrent.get("name") or h)
     want = h
     source_list = list(sources) if sources else list(DEFAULT_METADATA_SOURCES)
@@ -380,7 +417,8 @@ async def ensure_qbt_metadata(
         except Exception:
             log.debug("metadata emit failed for %s", kind, exc_info=True)
 
-    # Metadata may have arrived since the last sync snapshot.
+    # Metadata may have arrived since the last sync snapshot (or while waiting
+    # for this lock after another handoff finished).
     ready = await _ready_torrent_row(qbt, h, unknown_as_error=True)
     if ready is not None:
         return ready
