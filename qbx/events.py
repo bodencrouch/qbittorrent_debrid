@@ -15,6 +15,7 @@ class EventBus:
 
     def __init__(self, history: int = 200, state_path: Path | None = None) -> None:
         self._subscribers: set[asyncio.Queue] = set()
+        self._listeners: list = []  # sync callbacks (e.g. desktop notifier)
         self._history: list[dict] = []
         self._max_history = history
         self._state_path = Path(state_path) if state_path else None
@@ -22,6 +23,21 @@ class EventBus:
         self._lock = threading.Lock()
         self._unsaved_emits = 0
         self._persist_every = 25
+
+    def add_listener(self, callback) -> None:
+        """Register a sync callback invoked for every emit (outside the lock).
+
+        Callbacks must be fast and must not raise; exceptions are swallowed so
+        a broken listener can never take down event producers.
+        """
+        with self._lock:
+            if callback not in self._listeners:
+                self._listeners.append(callback)
+
+    def remove_listener(self, callback) -> None:
+        with self._lock:
+            if callback in self._listeners:
+                self._listeners.remove(callback)
 
     def _load_next_id(self) -> int:
         if not self._state_path or not self._state_path.exists():
@@ -58,11 +74,18 @@ class EventBus:
             self._history.append(event)
             del self._history[: -self._max_history]
             subscribers = list(self._subscribers)
+            listeners = list(self._listeners)
         for q in subscribers:
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:
                 # Slow consumer: drop the event for that subscriber.
+                pass
+        for cb in listeners:
+            try:
+                cb(event)
+            except Exception:
+                # Listener bugs must never break event producers.
                 pass
 
     def flush(self) -> None:

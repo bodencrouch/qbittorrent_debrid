@@ -1,0 +1,31 @@
+[Desktop Entry]
+Type=Application
+Name=qbx
+Comment=Debrid companion for qBittorrent — Control Shell + interceptor
+Exec=qbx --panel
+Icon=qbx
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=qBittorrent;debrid;Real-Debrid;AllDebrid;torrent;qbx;
+StartupNotify=true
+Actions=Panel;Tray;Status;Setup;
+
+[Desktop Action Panel]
+Name=Open Control Shell
+Exec=qbx --panel
+Icon=qbx
+
+[Desktop Action Tray]
+Name=Start Tray
+Exec=qbx --tray
+Icon=qbx
+
+[Desktop Action Status]
+Name=Show Status
+Exec=qbx --status
+Icon=qbx
+
+[Desktop Action Setup]
+Name=Run Setup Wizard
+Exec=qbx setup
+Icon=qbx

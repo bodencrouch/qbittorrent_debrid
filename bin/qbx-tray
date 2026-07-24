@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# qbx tray — PyQt6 native shell (KDE/Wayland), mirrors thirdflare-one-tray.
+set -euo pipefail
+
+_script="${BASH_SOURCE[0]}"
+while [[ -L "$_script" ]]; do
+  _dir="$(cd -- "$(dirname -- "$_script")" && pwd)"
+  _script="$(readlink "$_script")"
+  [[ "$_script" != /* ]] && _script="$_dir/$_script"
+done
+APP_DIR="$(cd -- "$(dirname -- "$_script")/.." && pwd)"
+unset _script _dir
+
+LAUNCHER="$APP_DIR/bin/qbx"
+ICON="$APP_DIR/assets/qbx.svg"
+QT_TRAY="$APP_DIR/scripts/tray-qt.py"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/qbx"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/qbx"
+TRAY_PID_FILE="${RUNTIME_DIR}/tray.pid"
+TRAY_LOG_FILE="${CACHE_DIR}/tray.log"
+
+usage() {
+  cat <<USAGE
+qbx tray
+
+Usage:
+  qbx-tray            Start the tray + native app shell (background)
+  qbx-tray --panel    Show the native app window (starts tray if needed)
+  qbx-tray --stop     Stop the tray
+  qbx-tray --check    Print tray readiness (exit 0 when ready)
+  qbx-tray --status   Show qbx status (notify when available)
+  qbx-tray --help     Show this help
+
+Also available as: qbx --tray / qbx --panel
+
+On KDE Plasma / Wayland the tray uses PyQt6 with the Control Shell embedded (left-click).
+USAGE
+}
+
+tray_python_bin() {
+  if [[ -n "${QBX_TRAY_PYTHON:-}" && -x "${QBX_TRAY_PYTHON}" ]]; then
+    printf '%s\n' "${QBX_TRAY_PYTHON}"
+    return 0
+  fi
+  if [[ -x /usr/bin/python3 ]]; then
+    printf '%s\n' /usr/bin/python3
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    command -v python3
+    return 0
+  fi
+  return 1
+}
+
+tray_qt_available() {
+  local py
+  py="$(tray_python_bin)" || return 1
+  "$py" - <<'PY' >/dev/null 2>&1
+from PyQt6.QtWidgets import QSystemTrayIcon
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+PY
+}
+
+tray_display_available() {
+  [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]
+}
+
+tray_install_hint() {
+  if command -v dnf >/dev/null 2>&1; then
+    echo "Install tray support with: sudo dnf install python3-pyqt6 python3-pyqt6-webengine"
+  elif command -v apt-get >/dev/null 2>&1; then
+    echo "Install tray support with: sudo apt install python3-pyqt6 python3-pyqt6.qtwebengine"
+  elif command -v pacman >/dev/null 2>&1; then
+    echo "Install tray support with: sudo pacman -S python-pyqt6 python-pyqt6-webengine"
+  else
+    echo "Install python3-pyqt6 and PyQt6-WebEngine for KDE/Wayland native app support."
+  fi
+}
+
+ensure_daemon() {
+  if ! "$LAUNCHER" --status >/dev/null 2>&1; then
+    echo "Starting qbx daemon for tray..." >&2
+    "$LAUNCHER" --no-open >/dev/null
+  fi
+}
+
+tray_process_running() {
+  pgrep -f "${QT_TRAY}" >/dev/null 2>&1
+}
+
+tray_already_running() {
+  if tray_process_running; then
+    return 0
+  fi
+  if [[ -f "$TRAY_PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$TRAY_PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$TRAY_PID_FILE"
+  fi
+  return 1
+}
+
+record_tray_pid() {
+  mkdir -p "$RUNTIME_DIR"
+  echo "$1" > "$TRAY_PID_FILE"
+}
+
+stop_tray() {
+  local pid
+  if tray_process_running; then
+    pkill -f "${QT_TRAY}" 2>/dev/null || true
+    echo "Stopped qbx tray."
+  elif [[ -f "$TRAY_PID_FILE" ]]; then
+    pid="$(cat "$TRAY_PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+    fi
+    echo "Stopped qbx tray."
+  else
+    echo "qbx tray is not running."
+  fi
+  rm -f "$TRAY_PID_FILE"
+}
+
+tray_registered() {
+  qdbus org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
+    org.kde.StatusNotifierWatcher.RegisteredStatusNotifierItems 2>/dev/null \
+    | grep -Eiq 'qbx'
+}
+
+start_tray_daemon() {
+  local py tray_pid
+  py="$(tray_python_bin)"
+  mkdir -p "$RUNTIME_DIR" "$CACHE_DIR"
+  : > "$TRAY_LOG_FILE"
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid env QBX_APP_DIR="$APP_DIR" QBX_SHOW_PANEL="${QBX_SHOW_PANEL:-}" \
+      "$py" -u "$QT_TRAY" >>"$TRAY_LOG_FILE" 2>&1 &
+  else
+    nohup env QBX_APP_DIR="$APP_DIR" QBX_SHOW_PANEL="${QBX_SHOW_PANEL:-}" \
+      "$py" -u "$QT_TRAY" >>"$TRAY_LOG_FILE" 2>&1 &
+  fi
+  tray_pid="$!"
+  record_tray_pid "$tray_pid"
+  printf '%s\n' "$tray_pid"
+}
+
+wait_for_tray() {
+  local tray_pid="$1"
+  local i
+  for i in $(seq 1 30); do
+    if ! kill -0 "$tray_pid" 2>/dev/null; then
+      echo "qbx tray failed to start. Log: $TRAY_LOG_FILE" >&2
+      tail -n 20 "$TRAY_LOG_FILE" >&2 || true
+      rm -f "$TRAY_PID_FILE"
+      return 1
+    fi
+    if tray_process_running && { tray_registered || [[ "$i" -ge 15 ]]; }; then
+      echo "qbx tray started (PyQt6, pid $tray_pid)." >&2
+      echo "Left-click the tray icon for the Control Shell; right-click for the menu." >&2
+      if command -v notify-send >/dev/null 2>&1; then
+        notify-send "qbx" "Tray started — look for the icon in the system tray." \
+          --icon=qbx >/dev/null 2>&1 || \
+        notify-send "qbx" "Tray started — look for the icon in the system tray." \
+          --icon="$ICON" >/dev/null 2>&1 || true
+      fi
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "qbx tray is running (pid $tray_pid)." >&2
+  return 0
+}
+
+run_tray_qt() {
+  local tray_pid
+  ensure_daemon
+  if tray_already_running; then
+    echo "qbx tray is already running." >&2
+    return 0
+  fi
+  tray_pid="$(start_tray_daemon)"
+  wait_for_tray "$tray_pid"
+}
+
+show_tray_panel() {
+  local pid
+  if tray_already_running; then
+    if [[ -f "$TRAY_PID_FILE" ]]; then
+      pid="$(cat "$TRAY_PID_FILE" 2>/dev/null || true)"
+      if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill -USR1 "$pid" 2>/dev/null || true
+        echo "qbx Control Shell requested (tray pid $pid)." >&2
+        return 0
+      fi
+    fi
+    echo "qbx tray is running but panel signal failed; restarting tray with panel." >&2
+    stop_tray
+  fi
+  QBX_SHOW_PANEL=1 run_tray_qt
+}
+
+print_check() {
+  if ! tray_display_available; then
+    echo "tray: unavailable (missing-display)"
+    return 1
+  fi
+  if tray_qt_available; then
+    echo "tray: ready"
+    echo "backend: qt"
+    echo "session: ${XDG_SESSION_TYPE:-unknown}"
+    echo "desktop: ${XDG_CURRENT_DESKTOP:-unknown}"
+    echo "qt: $(tray_python_bin) + PyQt6"
+    return 0
+  fi
+  echo "tray: unavailable (missing-qt)"
+  tray_install_hint >&2
+  return 1
+}
+
+notify_status() {
+  local text
+  text="$("$LAUNCHER" --status 2>&1 || true)"
+  printf '%s\n' "$text"
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "qbx" "$text" --icon="$ICON" >/dev/null 2>&1 || true
+  fi
+}
+
+case "${1:-}" in
+  --help|-h)
+    usage
+    ;;
+  --check)
+    print_check
+    ;;
+  --stop)
+    stop_tray
+    ;;
+  --status)
+    if tray_qt_available; then
+      QBX_APP_DIR="$APP_DIR" "$(tray_python_bin)" "$QT_TRAY" --status
+    else
+      notify_status
+    fi
+    ;;
+  --panel)
+    if ! tray_qt_available; then
+      echo "qbx tray requires PyQt6." >&2
+      tray_install_hint >&2
+      exit 1
+    fi
+    show_tray_panel
+    ;;
+  "")
+    if ! tray_qt_available; then
+      echo "qbx tray requires PyQt6." >&2
+      tray_install_hint >&2
+      exit 1
+    fi
+    if ! tray_display_available; then
+      echo "qbx tray needs a graphical session (DISPLAY or WAYLAND_DISPLAY)." >&2
+      exit 1
+    fi
+    run_tray_qt
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

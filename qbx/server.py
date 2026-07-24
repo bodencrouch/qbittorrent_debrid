@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
@@ -19,8 +19,11 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import __version__
 from .config import ConfigStore
 from .debrid import DebridManager
+from .desktop import DesktopNotifier, sync_tray_autostart
+from .update import check_for_update
 from .engine import Automation, Interceptor, match_torrent
 from .engine.matcher import (
     TorrentFileEntry,
@@ -51,6 +54,8 @@ class AppState:
     events: EventBus
     logs: LogBuffer
     boot_id: str
+    # Default keeps direct AppState(...) constructions in tests working.
+    notifier: DesktopNotifier = field(default_factory=lambda: DesktopNotifier(enabled=False))
 
 
 def _check_token(request: Request, supplied: str | None) -> None:
@@ -78,8 +83,24 @@ def create_app(store: ConfigStore | None = None) -> FastAPI:
         debrid = DebridManager(store.config)
         interceptor = Interceptor(store, qbt, debrid, events)
         automation = Automation(store, qbt, events, policy_runner=interceptor.scan_once)
-        app.state.qbx = AppState(store, qbt, debrid, interceptor, automation, events, logs, boot_id)
+        notifier = DesktopNotifier(
+            enabled=store.config.desktop.notifications,
+            kinds=store.config.desktop.notify_kinds,
+        )
+        events.add_listener(notifier)
+        app.state.qbx = AppState(
+            store, qbt, debrid, interceptor, automation, events, logs, boot_id, notifier
+        )
         qbt_proxy.ensure_proxy_client(app)
+        # Reconcile the XDG autostart entry with saved preference (best-effort).
+        # Only enforce the enabled state: removal happens exclusively through
+        # the explicit endpoint so an unconfigured daemon (or the test suite)
+        # never deletes an entry the user created by other means.
+        if store.config.desktop.tray_autostart:
+            try:
+                sync_tray_autostart(True)
+            except Exception:
+                log.debug("tray autostart reconcile failed", exc_info=True)
         if store.config.interceptor.enabled and (debrid.enabled or store.config.interceptor.manage_without_debrid):
             interceptor.start()
         if store.config.automation.watch_folders:
@@ -93,7 +114,7 @@ def create_app(store: ConfigStore | None = None) -> FastAPI:
             await qbt.aclose()
             await qbt_proxy.close_proxy_client(app)
 
-    app = FastAPI(title="qbx", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="qbx", version=__version__, lifespan=lifespan)
     _register_routes(app)
     _register_webui(app)
     return app
@@ -203,6 +224,8 @@ def _register_routes(app: FastAPI) -> None:
         }
         return {
             "ok": True,
+            "app": "qbx",
+            "version": __version__,
             "configured": state.store.config.configured,
             "debrid_enabled": state.debrid.enabled,
             "interceptor_running": state.interceptor.running,
@@ -219,6 +242,46 @@ def _register_routes(app: FastAPI) -> None:
                 "qbittorrent_webui": "/qbt/",
                 "matcher": "/?view=match",
             },
+        }
+
+    @app.get("/api/version")
+    async def version(request: Request):
+        cfg = request.app.state.qbx.store.config.updates
+        return {
+            "ok": True,
+            "app": "qbx",
+            "version": __version__,
+            "channel": cfg.channel,
+            "source": {"owner": cfg.source_owner, "repo": cfg.source_repo},
+            "check_on_startup": cfg.check_on_startup,
+        }
+
+    @app.get("/api/update/check", dependencies=[guard])
+    async def update_check(request: Request):
+        state: AppState = request.app.state.qbx
+        result = await check_for_update(state.store.config.updates)
+        if result.get("update_available"):
+            state.events.emit(
+                "update.available",
+                f"qbx {result.get('latest')} is available (current {result.get('current')})",
+                source="update",
+            )
+        return result
+
+    @app.post("/api/config/tray-autostart", dependencies=[guard])
+    async def config_tray_autostart(request: Request, body: dict):
+        if not isinstance(body.get("autostart"), bool):
+            raise HTTPException(status_code=400, detail="autostart must be a boolean")
+        state: AppState = request.app.state.qbx
+        desired = bool(body["autostart"])
+        sync = sync_tray_autostart(desired)
+        # Persist the preference only when the OS side effect succeeded.
+        if sync.get("ok"):
+            state.store.update({"desktop": {"tray_autostart": desired}})
+        return {
+            "ok": bool(sync.get("ok")),
+            "tray_autostart": state.store.config.desktop.tray_autostart,
+            "sync": sync,
         }
 
     @app.get("/api/config", dependencies=[guard])
@@ -238,6 +301,7 @@ def _register_routes(app: FastAPI) -> None:
         state.interceptor.rebind(state.qbt, state.debrid)
         state.automation.rebind(state.qbt)
         state.automation.set_policy_runner(state.interceptor.scan_once)
+        state.notifier.configure(cfg.desktop.notifications, cfg.desktop.notify_kinds)
         if cfg.interceptor.enabled and (state.debrid.enabled or cfg.interceptor.manage_without_debrid):
             state.interceptor.start()
         if cfg.automation.watch_folders:

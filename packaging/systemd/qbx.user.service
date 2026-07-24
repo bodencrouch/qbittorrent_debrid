@@ -1,0 +1,16 @@
+[Unit]
+Description=qbx debrid companion for qBittorrent (user)
+Documentation=file:%h/.local/share/qbx/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/qbx
+Environment=QBX_HOME=%h/.local/share/qbx
+ExecStart=%h/.local/share/qbx/venv/bin/qbx serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

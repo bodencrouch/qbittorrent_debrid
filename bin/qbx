@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# qbx launcher — start/reuse daemon, open tray/panel (thirdflare-one pattern).
+set -euo pipefail
+
+_script="${BASH_SOURCE[0]}"
+while [[ -L "$_script" ]]; do
+  _dir="$(cd -- "$(dirname -- "$_script")" && pwd)"
+  _script="$(readlink "$_script")"
+  [[ "$_script" != /* ]] && _script="$_dir/$_script"
+done
+APP_DIR="$(cd -- "$(dirname -- "$_script")/.." && pwd)"
+unset _script _dir
+
+APP_NAME="qbx"
+BASE_PORT="${QBX_PORT:-8484}"
+PORT="$BASE_PORT"
+HOST="${QBX_HOST:-127.0.0.1}"
+URL="http://${HOST}:${PORT}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/${APP_NAME}"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/${APP_NAME}"
+PID_FILE="${RUNTIME_DIR}/server.pid"
+LOG_FILE="${CACHE_DIR}/server.log"
+PORT_FILE="${RUNTIME_DIR}/server.port"
+
+mkdir -p "$RUNTIME_DIR" "$CACHE_DIR"
+
+qbx_cli() {
+  if [[ -x "${APP_DIR}/venv/bin/qbx" ]]; then
+    printf '%s\n' "${APP_DIR}/venv/bin/qbx"
+    return 0
+  fi
+  if [[ -x "${APP_DIR}/.venv/bin/qbx" ]]; then
+    printf '%s\n' "${APP_DIR}/.venv/bin/qbx"
+    return 0
+  fi
+  echo "qbx CLI not found at ${APP_DIR}/venv/bin/qbx. Run scripts/install-local.sh." >&2
+  return 1
+}
+
+usage() {
+  cat <<USAGE
+qbx — debrid companion for qBittorrent
+
+Usage:
+  qbx                    Start/reuse the daemon and open the Control Shell panel
+  qbx --no-open          Start/reuse the daemon only
+  qbx --status           Print daemon status
+  qbx --stop             Stop the managed daemon
+  qbx --tray             Start the native tray + app shell
+  qbx --panel            Show the native Control Shell window
+  qbx --version          Print qbx version
+  qbx --help             Show this help
+
+Passthrough (venv CLI):
+  qbx serve|setup|check|nudge|match …
+USAGE
+}
+
+set_port() {
+  PORT="$1"
+  URL="http://${HOST}:${PORT}"
+}
+
+health_ok() {
+  local code
+  code="$(curl -fsS --max-time 2 "${URL}/api/health" 2>/dev/null || true)"
+  [[ -n "$code" ]] || return 1
+  printf '%s' "$code" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' || return 1
+  printf '%s' "$code" | grep -q '"app"[[:space:]]*:[[:space:]]*"qbx"' || return 1
+  return 0
+}
+
+port_open() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn "sport = :${PORT}" 2>/dev/null | grep -q LISTEN
+  else
+    curl -fsS --max-time 1 "http://${HOST}:${PORT}/" >/dev/null 2>&1
+  fi
+}
+
+choose_port() {
+  local candidate
+  if [[ -f "$PORT_FILE" ]]; then
+    candidate="$(cat "$PORT_FILE" 2>/dev/null || true)"
+    if [[ -n "$candidate" ]]; then
+      set_port "$candidate"
+      if health_ok; then
+        return 0
+      fi
+    fi
+  fi
+  for candidate in $(seq "$BASE_PORT" "$((BASE_PORT + 30))"); do
+    set_port "$candidate"
+    if health_ok; then
+      echo "$PORT" > "$PORT_FILE"
+      return 0
+    fi
+    if ! port_open; then
+      echo "$PORT" > "$PORT_FILE"
+      return 0
+    fi
+  done
+  echo "No available local port found from $BASE_PORT to $((BASE_PORT + 30))." >&2
+  return 1
+}
+
+is_running() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid
+  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+start_server() {
+  local cli
+  choose_port
+  if health_ok; then
+    return 0
+  fi
+  if is_running && health_ok; then
+    return 0
+  fi
+  if is_running; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    rm -f "$PID_FILE"
+  fi
+
+  cli="$(qbx_cli)"
+  : > "$LOG_FILE"
+  (
+    cd "$APP_DIR"
+    if command -v setsid >/dev/null 2>&1; then
+      nohup setsid env QBX_HOME="$APP_DIR" "$cli" serve --host "$HOST" --port "$PORT" >>"$LOG_FILE" 2>&1 &
+    else
+      nohup env QBX_HOME="$APP_DIR" "$cli" serve --host "$HOST" --port "$PORT" >>"$LOG_FILE" 2>&1 &
+    fi
+    echo "$!" > "$PID_FILE"
+  )
+  echo "$PORT" > "$PORT_FILE"
+
+  local _
+  for _ in $(seq 1 100); do
+    if health_ok; then
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  echo "qbx daemon did not become healthy. Log: $LOG_FILE" >&2
+  if is_running; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    rm -f "$PID_FILE"
+  fi
+  return 1
+}
+
+stop_server() {
+  if is_running; then
+    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    rm -f "$PID_FILE"
+    echo "Stopped qbx daemon."
+  else
+    # Best-effort: stop anything we started that still holds the port
+    if health_ok; then
+      echo "qbx appears healthy but unmanaged; refuse to kill unknown process." >&2
+      echo "Stop it manually or use: kill \$(ss -ltnp 'sport = :${PORT}' …)" >&2
+      return 1
+    fi
+    echo "qbx daemon is not running."
+  fi
+}
+
+print_version() {
+  local cli
+  cli="$(qbx_cli)" || true
+  if [[ -n "${cli:-}" ]]; then
+    "$cli" --version 2>/dev/null && return 0
+  fi
+  if [[ -f "${APP_DIR}/pyproject.toml" ]]; then
+    grep -E '^version\s*=' "${APP_DIR}/pyproject.toml" | head -1 | sed 's/.*"\(.*\)".*/\1/'
+    return 0
+  fi
+  echo "unknown"
+}
+
+# Passthrough for classic CLI subcommands when first arg is a known command.
+case "${1:-}" in
+  serve|setup|check|nudge|match)
+    exec "$(qbx_cli)" "$@"
+    ;;
+esac
+
+case "${1:-}" in
+  --help|-h)
+    usage
+    ;;
+  --version|-V)
+    print_version
+    ;;
+  --status)
+    choose_port >/dev/null 2>&1 || true
+    if health_ok; then
+      echo "qbx is running at $URL"
+      exit 0
+    fi
+    echo "qbx is not running."
+    exit 1
+    ;;
+  --stop)
+    stop_server
+    ;;
+  --tray)
+    start_server >/dev/null
+    exec "$APP_DIR/bin/qbx-tray"
+    ;;
+  --panel)
+    start_server >/dev/null
+    exec "$APP_DIR/bin/qbx-tray" --panel
+    ;;
+  --no-open)
+    start_server
+    echo "$URL"
+    ;;
+  "")
+    start_server >/dev/null
+    exec "$APP_DIR/bin/qbx-tray" --panel
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

@@ -109,6 +109,41 @@ export type EventEntry = {
   [key: string]: unknown;
 };
 
+export type VersionInfo = {
+  ok: boolean;
+  app: string;
+  version: string;
+  channel: "stable" | "beta";
+  source: { owner: string; repo: string };
+  check_on_startup: boolean;
+};
+
+export type UpdateCheckResult = {
+  ok: boolean;
+  update_available: boolean;
+  downgrade: boolean;
+  current: string;
+  latest: string | null;
+  channel: string;
+  source: { owner: string; repo: string };
+  release: {
+    tag: string;
+    name: string;
+    prerelease: boolean;
+    published_at?: string;
+    html_url?: string;
+    body?: string;
+  } | null;
+  guided_commands: string[];
+  error: string | null;
+};
+
+export type TrayAutostartResult = {
+  ok: boolean;
+  tray_autostart: boolean;
+  sync: { ok: boolean; enabled: boolean; path: string; action: string; reason?: string };
+};
+
 export const QBitService = {
   async Connect(_creds?: { url: string; username: string; password: string }): Promise<void> {
     const r = await api<{ ok: boolean; error?: string }>("/api/qbt/test", { method: "POST" });
@@ -334,6 +369,21 @@ export const ControlApi = {
 
   updateConfig(patch: Record<string, unknown>): Promise<Record<string, unknown>> {
     return api("/api/config", { method: "POST", body: JSON.stringify(patch) });
+  },
+
+  version(): Promise<VersionInfo> {
+    return api("/api/version");
+  },
+
+  updateCheck(): Promise<UpdateCheckResult> {
+    return api("/api/update/check");
+  },
+
+  setTrayAutostart(autostart: boolean): Promise<TrayAutostartResult> {
+    return api("/api/config/tray-autostart", {
+      method: "POST",
+      body: JSON.stringify({ autostart }),
+    });
   },
 };
 
