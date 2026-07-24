@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 
 import httpx
@@ -13,6 +14,7 @@ from qbx.engine.interceptor import Interceptor
 from qbx.engine.metadata import (
     MetadataHandoffError,
     _assert_public_http_url,
+    _assert_safe_metadata_url,
     ensure_qbt_metadata,
     fetch_torrent_bytes,
     infohash_v1_from_torrent,
@@ -330,6 +332,13 @@ async def test_ensure_hash_mismatch_fails(monkeypatch):
 async def test_fetch_torrent_bytes_cache_hit(monkeypatch):
     content, h = make_torrent_bytes()
 
+    class FakeResp:
+        status_code = 200
+        headers: dict = {}
+
+        async def aiter_bytes(self):
+            yield content
+
     class FakeClient:
         def __init__(self, *a, **k):
             pass
@@ -342,9 +351,15 @@ async def test_fetch_torrent_bytes_cache_hit(monkeypatch):
 
         async def get(self, url, **kwargs):
             assert h.upper() in url or h in url
-            return httpx.Response(200, content=content)
+            return FakeResp()
+
+    async def fake_getaddrinfo(host, port, *a, **k):
+        assert host == "cache.example"
+        return [(None, None, None, None, ("203.0.113.10", port))]
 
     monkeypatch.setattr("qbx.engine.metadata.httpx.AsyncClient", FakeClient)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
     got, local = await fetch_torrent_bytes(
         h,
         ["https://cache.example/torrent/{HASH}.torrent"],
@@ -356,6 +371,14 @@ async def test_fetch_torrent_bytes_cache_hit(monkeypatch):
 
 
 async def test_fetch_torrent_bytes_miss(monkeypatch):
+    class FakeResp:
+        status_code = 404
+        headers: dict = {}
+
+        async def aiter_bytes(self):
+            if False:  # pragma: no cover
+                yield b""
+
     class FakeClient:
         def __init__(self, *a, **k):
             pass
@@ -367,9 +390,14 @@ async def test_fetch_torrent_bytes_miss(monkeypatch):
             return None
 
         async def get(self, url, **kwargs):
-            return httpx.Response(404, content=b"nope")
+            return FakeResp()
+
+    async def fake_getaddrinfo(host, port, *a, **k):
+        return [(None, None, None, None, ("203.0.113.10", port))]
 
     monkeypatch.setattr("qbx.engine.metadata.httpx.AsyncClient", FakeClient)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
     with pytest.raises(MetadataHandoffError, match="cache miss"):
         await fetch_torrent_bytes(
             "abcd" + "0" * 36,
@@ -602,6 +630,59 @@ def test_assert_public_http_url_blocks_loopback_and_link_local():
         _assert_public_http_url("http://metadata.google.internal/")
     # Operator LAN caches remain allowed.
     _assert_public_http_url("http://192.168.4.23:18099/h.torrent")
+
+
+async def test_assert_safe_metadata_url_blocks_dns_to_loopback(monkeypatch):
+    async def fake_getaddrinfo(host, port, *a, **k):
+        assert host == "evil.invalid"
+        return [
+            (None, None, None, None, ("127.0.0.1", port)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(MetadataHandoffError, match=r"blocked.*127\.0\.0\.1"):
+        await _assert_safe_metadata_url("https://evil.invalid/x.torrent")
+
+
+async def test_fetch_rejects_hostname_resolving_to_link_local(monkeypatch):
+    content, h = make_torrent_bytes()
+
+    class FakeResp:
+        def __init__(self, status_code, headers=None):
+            self.status_code = status_code
+            self.headers = headers or {}
+
+        async def aiter_bytes(self):
+            if False:  # pragma: no cover
+                yield b""
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def get(self, url, timeout=None):
+            raise AssertionError(f"GET must not run for blocked host: {url}")
+
+    async def fake_getaddrinfo(host, port, *a, **k):
+        return [(None, None, None, None, ("169.254.169.254", port))]
+
+    monkeypatch.setattr("qbx.engine.metadata.httpx.AsyncClient", FakeClient)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(MetadataHandoffError, match="blocked|cache miss"):
+        await fetch_torrent_bytes(
+            h,
+            ["https://meta-ssrf.invalid/{hash}.torrent"],
+            AnonymityConfig(enabled=False),
+            timeout_seconds=5,
+        )
 
 
 async def test_fetch_rejects_redirect_to_loopback(monkeypatch):

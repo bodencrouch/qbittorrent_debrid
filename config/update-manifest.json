@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "stable": null,
+  "beta": null,
+  "_comment": "Optional channel pointers for future packaging. Check-only updates currently use GitHub Releases for updates.source_owner/source_repo; leave source empty to disable."
+}

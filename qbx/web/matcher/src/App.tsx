@@ -49,6 +49,33 @@ export default function App() {
     return () => window.clearInterval(id)
   }, [refreshHealth])
 
+  // One startup update check per browser session; only toasts when something
+  // is actionable (update available). Silent on errors/up-to-date.
+  useEffect(() => {
+    if (sessionStorage.getItem("qbx_update_checked")) return
+    let cancelled = false
+    ControlApi.version()
+      .then((v) => {
+        if (cancelled || !v.check_on_startup || !v.source.owner || !v.source.repo) return
+        sessionStorage.setItem("qbx_update_checked", "1")
+        return ControlApi.updateCheck().then((res) => {
+          if (cancelled || !res.ok || !res.update_available) return
+          toast.info(`qbx ${res.latest} is available`, {
+            action: res.release?.html_url
+              ? {
+                  label: "Release notes",
+                  onClick: () => window.open(res.release!.html_url, "_blank", "noopener,noreferrer"),
+                }
+              : undefined,
+          })
+        })
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   useEffect(() => {
     const onMsg = (ev: MessageEvent) => {
       if (ev.origin !== window.location.origin) return

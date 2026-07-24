@@ -19,11 +19,51 @@ pip install .
 pip install -e ".[dev]"
 ```
 
-Or run the bundled installer:
+Or run the bundled installer (venv in the repo):
 
 ```bash
 ./install.sh
 ```
+
+### Desktop / KDE Plasma (recommended on Linux)
+
+Install to `~/.local/share/qbx`, add Kickoff/application menu entries, and pin
+**qbx** to Plasma favorites:
+
+```bash
+./scripts/install-local.sh
+```
+
+Then launch from Kickoff or:
+
+```bash
+qbx              # start daemon + native Control Shell panel
+qbx --tray       # tray only
+qbx --no-open    # daemon only
+qbx-tray --check # verify PyQt6 tray readiness
+```
+
+Requires system packages `python3-pyqt6` and `python3-pyqt6-webengine` for the
+native tray shell (Fedora: `sudo dnf install python3-pyqt6 python3-pyqt6-webengine`).
+
+Both installers build the Control Shell first (Node 18+ / `npm` required unless
+`qbx/web/matcher/dist` is already built) and fail rather than install a UI-less
+daemon; the built shell also ships inside the Python wheel.
+
+### Updates, notifications, tray autostart
+
+Settings → **Application** in the Control Shell provides:
+
+- **Check-only updates** — compares the running version against GitHub Releases
+  for the configured `updates.source_owner/source_repo` (stable or beta
+  channel), links to the release, and prints the reinstall commands. Nothing is
+  downloaded or applied automatically.
+- **Desktop notifications** — `notify-send` on debrid delivery completion or
+  failure (allowlisted event kinds; disable with `QBX_DISABLE_NOTIFICATIONS=1`
+  or the Settings toggle).
+- **Start tray at login** — writes/removes `~/.config/autostart/qbx-tray.desktop`
+  immediately via `POST /api/config/tray-autostart`; the tray starts or reuses
+  the daemon, so don't combine it with the optional systemd user service.
 
 ## Web UI
 
