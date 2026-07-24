@@ -29,11 +29,123 @@ def test_health_includes_recent_events_for_dashboard_hydration(tmp_path):
     assert health["events"][-1]["kind"] == "scan.manual.start"
     assert health["events"][-1]["message"] == "Starting manual full policy scan"
     assert health["boot_id"]
+    assert health["app"] == "qbx"
     assert "last_log_id" in health
+    from qbx import __version__
+
+    assert health["version"] == __version__
     # Health must stay lean — no bulky decision lists that block Settings.
     assert "recent_decisions" not in health.get("interceptor", {})
     assert "last_policy_pass" not in health.get("interceptor", {})
     assert "skip_reasons" not in health.get("interceptor", {})
+
+
+def test_version_endpoint_reports_package_version(tmp_path):
+    from qbx import __version__
+
+    store = ConfigStore(tmp_path)
+    store.update({
+        "configured": True,
+        "interceptor": {"enabled": False, "manage_without_debrid": False},
+        "updates": {"channel": "beta", "source_owner": "acme", "source_repo": "qbx"},
+    })
+
+    app = create_app(store)
+    with TestClient(app) as client:
+        res = client.get("/api/version").json()
+
+    assert res["ok"] is True
+    assert res["app"] == "qbx"
+    assert res["version"] == __version__
+    assert res["channel"] == "beta"
+    assert res["source"] == {"owner": "acme", "repo": "qbx"}
+    assert app.version == __version__
+
+
+def test_update_check_endpoint_emits_event_when_available(tmp_path, monkeypatch):
+    store = ConfigStore(tmp_path)
+    store.update({
+        "configured": True,
+        "interceptor": {"enabled": False, "manage_without_debrid": False},
+        "updates": {"source_owner": "acme", "source_repo": "qbx"},
+    })
+
+    async def fake_check(cfg):
+        return {"ok": True, "update_available": True, "current": "0.1.0", "latest": "0.2.0"}
+
+    monkeypatch.setattr("qbx.server.check_for_update", fake_check)
+    app = create_app(store)
+    with TestClient(app) as client:
+        res = client.get("/api/update/check").json()
+        kinds = [e["kind"] for e in client.app.state.qbx.events.history]
+
+    assert res["update_available"] is True
+    assert "update.available" in kinds
+
+
+def test_update_check_unconfigured_source_is_structured(tmp_path):
+    store = ConfigStore(tmp_path)
+    store.update({
+        "configured": True,
+        "interceptor": {"enabled": False, "manage_without_debrid": False},
+    })
+
+    app = create_app(store)
+    with TestClient(app) as client:
+        res = client.get("/api/update/check")
+
+    assert res.status_code == 200
+    body = res.json()
+    assert body["ok"] is False
+    assert "not configured" in body["error"]
+
+
+def test_tray_autostart_endpoint_persists_and_syncs(tmp_path, monkeypatch):
+    store = ConfigStore(tmp_path)
+    store.update({
+        "configured": True,
+        "interceptor": {"enabled": False, "manage_without_debrid": False},
+    })
+
+    calls: list[bool] = []
+
+    def fake_sync(enabled: bool):
+        calls.append(enabled)
+        return {"ok": True, "enabled": enabled, "path": "/tmp/x.desktop", "action": "written"}
+
+    monkeypatch.setattr("qbx.server.sync_tray_autostart", fake_sync)
+    app = create_app(store)
+    with TestClient(app) as client:
+        bad = client.post("/api/config/tray-autostart", json={"autostart": "yes"})
+        assert bad.status_code == 400
+
+        res = client.post("/api/config/tray-autostart", json={"autostart": True}).json()
+
+    assert res["ok"] is True
+    assert res["tray_autostart"] is True
+    assert store.config.desktop.tray_autostart is True
+    # Called for the POST and once at startup reconcile.
+    assert True in calls
+
+
+def test_tray_autostart_failure_does_not_persist(tmp_path, monkeypatch):
+    store = ConfigStore(tmp_path)
+    store.update({
+        "configured": True,
+        "interceptor": {"enabled": False, "manage_without_debrid": False},
+    })
+
+    def fake_sync(enabled: bool):
+        return {"ok": False, "enabled": False, "path": "", "action": "skipped", "reason": "launcher not found"}
+
+    monkeypatch.setattr("qbx.server.sync_tray_autostart", fake_sync)
+    app = create_app(store)
+    with TestClient(app) as client:
+        res = client.post("/api/config/tray-autostart", json={"autostart": True}).json()
+
+    assert res["ok"] is False
+    assert res["tray_autostart"] is False
+    assert store.config.desktop.tray_autostart is False
 
 
 def test_interceptor_nudge_endpoint(tmp_path):

@@ -56,6 +56,19 @@ anonymity:
   random_user_agent: true
   strip_trackers: true
 
+# Check-only updates: qbx compares against GitHub Releases and links to the
+# release — it never downloads or applies binaries. Empty source = disabled.
+updates:
+  channel: stable        # stable | beta (beta accepts prereleases)
+  source_owner: ""       # e.g. youruser
+  source_repo: ""        # e.g. qbx
+  check_on_startup: true
+
+desktop:
+  notifications: true    # notify-send on debrid delivery / failures
+  # notify_kinds: [intercept.done, intercept.failed, download.done, scan.manual.failed]
+  tray_autostart: false  # managed via Settings -> "Start tray at login"
+
 # Providers are usually set via WebUI Settings, env (QBX_*_API_KEY), or CLI.
 # Uncomment to seed provisional defaults:
 # providers:

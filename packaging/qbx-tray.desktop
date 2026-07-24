@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=qbx Tray
+Comment=qbx system tray and Control Shell
+Exec=qbx-tray
+Icon=qbx
+Terminal=false
+Categories=Network;FileTransfer;
+Hidden=true
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+StartupNotify=false

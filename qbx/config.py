@@ -186,6 +186,34 @@ class QualityConfig(BaseModel):
     prefer_debrid: bool = True
 
 
+# Event kinds that may raise a desktop notification. Everything else stays in
+# the SSE stream / UI toasts — the interceptor is far too chatty for native
+# notifications (policy passes, sync updates, scan summaries).
+DEFAULT_NOTIFY_KINDS = [
+    "intercept.done",
+    "intercept.failed",
+    "download.done",
+    "scan.manual.failed",
+]
+
+
+class UpdatesConfig(BaseModel):
+    """Check-only updates: qbx never applies binaries for source/venv installs."""
+
+    channel: Literal["stable", "beta"] = "stable"
+    # GitHub source, e.g. owner="youruser", repo="qbx". Empty = checks disabled.
+    source_owner: str = ""
+    source_repo: str = ""
+    check_on_startup: bool = True
+
+
+class DesktopConfig(BaseModel):
+    notifications: bool = True
+    notify_kinds: list[str] = Field(default_factory=lambda: list(DEFAULT_NOTIFY_KINDS))
+    # Start the tray (qbx-tray) at login via an XDG autostart entry.
+    tray_autostart: bool = False
+
+
 class AppConfig(BaseModel):
     configured: bool = False  # flipped by onboarding wizard / `qbx setup`
     server: ServerConfig = Field(default_factory=ServerConfig)
@@ -197,6 +225,8 @@ class AppConfig(BaseModel):
     matcher: MatcherConfig = Field(default_factory=MatcherConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
     quality: QualityConfig = Field(default_factory=QualityConfig)
+    updates: UpdatesConfig = Field(default_factory=UpdatesConfig)
+    desktop: DesktopConfig = Field(default_factory=DesktopConfig)
 
 
 def config_dir() -> Path:

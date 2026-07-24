@@ -3,7 +3,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
-import { ControlApi } from "@/api/backend"
+import { ControlApi, type UpdateCheckResult } from "@/api/backend"
 import { getErrorMessage } from "@/lib/utils"
 import { uiLog } from "@/lib/ui-log"
 import { toast } from "sonner"
@@ -36,6 +36,12 @@ type SettingsForm = {
   random_user_agent: boolean
   strip_trackers: boolean
   providers: ProviderForm[]
+  update_channel: "stable" | "beta"
+  update_source_owner: string
+  update_source_repo: string
+  update_check_on_startup: boolean
+  desktop_notifications: boolean
+  tray_autostart: boolean
 }
 
 function emptyProviders(): ProviderForm[] {
@@ -63,6 +69,8 @@ function fromConfig(cfg: Record<string, unknown>): SettingsForm {
       has_secret: key === REDACTED || Boolean(key),
     }
   })
+  const updates = (cfg.updates || {}) as Record<string, unknown>
+  const desktop = (cfg.desktop || {}) as Record<string, unknown>
   const pw = String(qbt.password || "")
   const token = String(server.api_token || "")
   const proxy = String(anonymity.proxy_url || "")
@@ -82,6 +90,12 @@ function fromConfig(cfg: Record<string, unknown>): SettingsForm {
     random_user_agent: anonymity.random_user_agent !== false,
     strip_trackers: anonymity.strip_trackers !== false,
     providers,
+    update_channel: updates.channel === "beta" ? "beta" : "stable",
+    update_source_owner: String(updates.source_owner || ""),
+    update_source_repo: String(updates.source_repo || ""),
+    update_check_on_startup: updates.check_on_startup !== false,
+    desktop_notifications: desktop.notifications !== false,
+    tray_autostart: Boolean(desktop.tray_autostart),
   }
 }
 
@@ -95,6 +109,10 @@ export function SettingsPanel({ open, onClose, onSaved }: SettingsPanelProps) {
   const [form, setForm] = useState<SettingsForm | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState("")
+  const [version, setVersion] = useState("")
+  const [updateBusy, setUpdateBusy] = useState(false)
+  const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null)
+  const [trayBusy, setTrayBusy] = useState(false)
 
   useEffect(() => {
     if (!open) return
@@ -127,6 +145,11 @@ export function SettingsPanel({ open, onClose, onSaved }: SettingsPanelProps) {
         })
     }
     load()
+    ControlApi.version()
+      .then((v) => {
+        if (!cancelled) setVersion(v.version)
+      })
+      .catch(() => undefined)
     return () => {
       cancelled = true
     }
@@ -147,6 +170,47 @@ export function SettingsPanel({ open, onClose, onSaved }: SettingsPanelProps) {
         providers: prev.providers.map((p) => (p.name === name ? { ...p, ...patch } : p)),
       }
     })
+  }
+
+  const checkUpdates = async () => {
+    setUpdateBusy(true)
+    setUpdateResult(null)
+    try {
+      const res = await ControlApi.updateCheck()
+      setUpdateResult(res)
+      if (!res.ok) {
+        toast.error(res.error || "Update check failed")
+      } else if (res.update_available) {
+        toast.info(`qbx ${res.latest} is available`)
+      } else {
+        toast.success("qbx is up to date")
+      }
+    } catch (err) {
+      toast.error(getErrorMessage(err))
+    } finally {
+      setUpdateBusy(false)
+    }
+  }
+
+  const toggleTrayAutostart = async (next: boolean) => {
+    if (!form) return
+    setTrayBusy(true)
+    const prev = form.tray_autostart
+    setForm({ ...form, tray_autostart: next })
+    try {
+      const res = await ControlApi.setTrayAutostart(next)
+      if (!res.ok) {
+        setForm((f) => (f ? { ...f, tray_autostart: prev } : f))
+        toast.error(res.sync?.reason || "Could not update tray autostart")
+      } else {
+        toast.success(next ? "Tray will start at login" : "Tray autostart disabled")
+      }
+    } catch (err) {
+      setForm((f) => (f ? { ...f, tray_autostart: prev } : f))
+      toast.error(getErrorMessage(err))
+    } finally {
+      setTrayBusy(false)
+    }
   }
 
   const save = async () => {
@@ -195,6 +259,17 @@ export function SettingsPanel({ open, onClose, onSaved }: SettingsPanelProps) {
           strip_trackers: form.strip_trackers,
         },
         providers,
+        updates: {
+          channel: form.update_channel,
+          source_owner: form.update_source_owner.trim(),
+          source_repo: form.update_source_repo.trim(),
+          check_on_startup: form.update_check_on_startup,
+        },
+        desktop: {
+          notifications: form.desktop_notifications,
+          // tray_autostart is persisted through its dedicated endpoint
+          // (it has an OS side effect) — do not clobber it here.
+        },
       })
       if (form.api_token.trim()) {
         localStorage.setItem("qbx_token", form.api_token.trim())
@@ -423,6 +498,121 @@ export function SettingsPanel({ open, onClose, onSaved }: SettingsPanelProps) {
                   </div>
                 </div>
               ))}
+            </div>
+          </section>
+
+          <section className="space-y-3 lg:col-span-2">
+            <div className="flex items-center gap-2">
+              <h3 className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+                Application
+              </h3>
+              {version && (
+                <Badge variant="outline" className="text-[10px] font-mono">
+                  qbx v{version}
+                </Badge>
+              )}
+            </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="space-y-2">
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="space-y-1.5">
+                    <Label className="text-[11px]">Update channel</Label>
+                    <select
+                      className="h-8 w-full rounded-md border border-input bg-transparent px-2 text-xs"
+                      value={form.update_channel}
+                      onChange={(e) =>
+                        setForm({ ...form, update_channel: e.target.value as "stable" | "beta" })
+                      }
+                    >
+                      <option value="stable">stable</option>
+                      <option value="beta">beta (prereleases)</option>
+                    </select>
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label className="text-[11px]">GitHub source (owner / repo)</Label>
+                    <div className="flex gap-1">
+                      <Input
+                        className="h-8 text-xs font-mono"
+                        value={form.update_source_owner}
+                        onChange={(e) => setForm({ ...form, update_source_owner: e.target.value })}
+                        placeholder="owner"
+                      />
+                      <Input
+                        className="h-8 text-xs font-mono"
+                        value={form.update_source_repo}
+                        onChange={(e) => setForm({ ...form, update_source_repo: e.target.value })}
+                        placeholder="repo"
+                      />
+                    </div>
+                  </div>
+                </div>
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    className="accent-sky-500"
+                    checked={form.update_check_on_startup}
+                    onChange={(e) => setForm({ ...form, update_check_on_startup: e.target.checked })}
+                  />
+                  Check for updates when the shell opens
+                </label>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 text-xs"
+                    onClick={() => void checkUpdates()}
+                    disabled={updateBusy}
+                  >
+                    {updateBusy ? "Checking…" : "Check for updates"}
+                  </Button>
+                  {updateResult?.ok && updateResult.update_available && updateResult.release?.html_url && (
+                    <a
+                      className="text-xs text-sky-400 underline"
+                      href={updateResult.release.html_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      {updateResult.latest} release notes
+                    </a>
+                  )}
+                  {updateResult?.ok && !updateResult.update_available && !updateResult.error && (
+                    <span className="text-xs text-muted-foreground">up to date</span>
+                  )}
+                  {updateResult && updateResult.error && (
+                    <span className="text-xs text-amber-400">{updateResult.error}</span>
+                  )}
+                </div>
+                {updateResult?.ok && updateResult.update_available && updateResult.guided_commands.length > 0 && (
+                  <pre className="rounded-md border border-border bg-card/60 p-2 text-[10px] font-mono overflow-auto">
+                    {updateResult.guided_commands.join("\n")}
+                  </pre>
+                )}
+              </div>
+              <div className="space-y-2">
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    className="accent-sky-500"
+                    checked={form.desktop_notifications}
+                    onChange={(e) => setForm({ ...form, desktop_notifications: e.target.checked })}
+                  />
+                  Desktop notifications (debrid delivery, failures)
+                </label>
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    className="accent-sky-500"
+                    checked={form.tray_autostart}
+                    disabled={trayBusy}
+                    onChange={(e) => void toggleTrayAutostart(e.target.checked)}
+                  />
+                  Start tray at login (applies immediately)
+                </label>
+                <p className="text-[10px] text-muted-foreground max-w-md">
+                  Updates are check-only: qbx links to the GitHub release and shows the
+                  reinstall commands — nothing is downloaded or applied automatically.
+                </p>
+              </div>
             </div>
           </section>
         </div>

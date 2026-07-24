@@ -12,6 +12,7 @@ import hashlib
 import ipaddress
 import logging
 import re
+import socket
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any, NoReturn
@@ -295,7 +296,7 @@ async def _get_torrent_body(
     """GET with hop validation and a hard body size cap."""
     current = url
     for _ in range(max_redirects + 1):
-        _assert_public_http_url(current)
+        await _assert_safe_metadata_url(current)
         resp = await client.get(current, timeout=timeout_seconds)
         if resp.status_code in {301, 302, 303, 307, 308}:
             location = resp.headers.get("location")
@@ -335,6 +336,45 @@ def _assert_public_http_url(url: str) -> None:
         raise MetadataHandoffError(f"refusing blocked metadata host: {host}")
 
 
+async def _assert_safe_metadata_url(url: str) -> None:
+    """Refuse metadata URLs whose host is or resolves to a blocked address class.
+
+    RFC1918 / ULA remain allowed so operators can point ``metadata_sources`` at
+    LAN caches. True connect-time IP pinning (anti DNS-rebinding) is deferred.
+    """
+    _assert_public_http_url(url)
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower()
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+        return  # Literal already classified by _host_blocked_for_metadata_fetch.
+    except ValueError:
+        pass
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            host,
+            port,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
+    except OSError as exc:
+        raise MetadataHandoffError(f"DNS lookup failed for {host}: {exc}") from exc
+    if not infos:
+        raise MetadataHandoffError(f"DNS lookup returned no addresses for {host}")
+    for info in infos:
+        sockaddr = info[4]
+        ip_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if _ip_blocked_for_metadata_fetch(ip):
+            raise MetadataHandoffError(
+                f"refusing blocked metadata host: {host} -> {ip}"
+            )
+
+
 def _host_blocked_for_metadata_fetch(host: str) -> bool:
     """Block loopback / link-local / metadata endpoints; allow RFC1918 for LAN caches."""
     h = host.strip("[]").lower()
@@ -346,6 +386,10 @@ def _host_blocked_for_metadata_fetch(host: str) -> bool:
         ip = ipaddress.ip_address(h)
     except ValueError:
         return False
+    return _ip_blocked_for_metadata_fetch(ip)
+
+
+def _ip_blocked_for_metadata_fetch(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return bool(
         ip.is_loopback
         or ip.is_link_local
