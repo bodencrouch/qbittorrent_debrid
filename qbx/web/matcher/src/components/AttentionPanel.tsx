@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
 import {
   AttentionService,
+  ApiError,
   ControlApi,
   type AttentionItem,
   type AttentionPayload,
@@ -38,13 +39,20 @@ export function AttentionPanel({
 }: AttentionPanelProps) {
   const [payload, setPayload] = useState<AttentionPayload | null>(null)
   const [loading, setLoading] = useState(true)
+  const [authRequired, setAuthRequired] = useState(false)
 
   const load = useCallback(async () => {
     try {
       const data = await AttentionService.get()
       setPayload(data)
+      setAuthRequired(false)
     } catch (err) {
-      toast.error(getErrorMessage(err))
+      if (err instanceof ApiError && err.status === 401) {
+        setAuthRequired(true)
+        setPayload(null)
+      } else {
+        toast.error(getErrorMessage(err))
+      }
     } finally {
       setLoading(false)
     }
@@ -75,6 +83,9 @@ export function AttentionPanel({
           toast.success("Policy scan queued")
           onRefreshHealth?.()
           await load()
+          break
+        case "open_qbt":
+          window.open("/qbt/", "_blank")
           break
         default:
           break
@@ -108,10 +119,27 @@ export function AttentionPanel({
         </Button>
       </div>
 
-      {loading && !payload ? (
+      {loading && !payload && !authRequired ? (
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <Spinner />
           Loading attention queue…
+        </div>
+      ) : authRequired ? (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-4 text-sm">
+          <p className="font-medium text-foreground">API token required</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Header counts come from <code className="text-[10px]">/api/health</code>. Open Settings,
+            enter your qbx API token, and save to load the full attention queue here.
+          </p>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="mt-3 h-7 text-[10px]"
+            onClick={() => onOpenSettings?.("application")}
+          >
+            Open Settings → Application
+          </Button>
         </div>
       ) : items.length === 0 ? (
         <div className="rounded-md border border-dashed border-border/60 p-6 text-center text-sm text-muted-foreground">
