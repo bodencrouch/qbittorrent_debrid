@@ -311,6 +311,8 @@ class ContentDupesConfig(BaseModel):
     ``protected_roots`` are never offered as removal candidates — mark the
     library sacred and leave incomplete / download dirs expendable. Deletions
     move into a same-volume quarantine, so space is reclaimed only on purge.
+    
+    Inspired by alldup: supports filtering by file type, extension, and patterns.
     """
 
     roots: list[str] = Field(default_factory=list)
@@ -319,6 +321,18 @@ class ContentDupesConfig(BaseModel):
     default_keeper_rule: Literal["newest", "oldest", "shortest_path", "under_root"] = "newest"
     # "" = quarantine beside the owning root (always same-volume, cheap rename).
     quarantine_dir: str = ""
+    
+    # Filtering options (inspired by alldup)
+    # File extensions to include (empty = all)
+    include_extensions: list[str] = Field(default_factory=list)
+    # File extensions to exclude
+    exclude_extensions: list[str] = Field(default_factory=list)
+    # Glob patterns for files to exclude
+    exclude_patterns: list[str] = Field(default_factory=list)
+    # Only scan files modified in the last N days (0 = all)
+    max_age_days: int = 0
+    # Skip hidden files/directories
+    skip_hidden: bool = True
 
 
 class WatchFolderRule(BaseModel):
