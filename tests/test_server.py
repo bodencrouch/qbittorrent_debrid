@@ -147,6 +147,76 @@ def test_tray_autostart_failure_does_not_persist(tmp_path, monkeypatch):
     assert store.config.desktop.tray_autostart is False
 
 
+def test_soft_config_patch_skips_interceptor_rebind(tmp_path):
+    store = ConfigStore(tmp_path)
+    store.update({
+        "configured": True,
+        "interceptor": {"enabled": False, "manage_without_debrid": False, "stalled_min_minutes": 30},
+        "desktop": {"notifications": True},
+    })
+
+    app = create_app(store)
+    with TestClient(app) as client:
+        state = client.app.state.qbx
+        qbt_before = state.qbt
+        stop_calls = {"n": 0}
+
+        async def counting_stop():
+            stop_calls["n"] += 1
+
+        state.interceptor.stop = counting_stop  # type: ignore[method-assign]
+        res = client.post(
+            "/api/config",
+            json={"desktop": {"notifications": False}, "interceptor": {"stalled_min_minutes": 45}},
+        )
+        assert res.status_code == 200
+        assert stop_calls["n"] == 0
+        assert client.app.state.qbx.qbt is qbt_before
+        assert store.config.desktop.notifications is False
+        assert store.config.interceptor.stalled_min_minutes == 45
+
+
+def test_hard_config_patch_rebinds_qbt(tmp_path):
+    store = ConfigStore(tmp_path)
+    store.update({
+        "configured": True,
+        "interceptor": {"enabled": False, "manage_without_debrid": False},
+        "qbt": {"url": "http://127.0.0.1:8080"},
+    })
+
+    app = create_app(store)
+    with TestClient(app) as client:
+        state = client.app.state.qbx
+        qbt_before = state.qbt
+        stop_calls = {"n": 0}
+
+        async def counting_stop():
+            stop_calls["n"] += 1
+
+        state.interceptor.stop = counting_stop  # type: ignore[method-assign]
+        res = client.post("/api/config", json={"qbt": {"url": "http://127.0.0.1:9090"}})
+        assert res.status_code == 200
+        assert stop_calls["n"] == 1
+        assert client.app.state.qbx.qbt is not qbt_before
+        assert store.config.qbt.url == "http://127.0.0.1:9090"
+
+
+def test_soft_config_preserves_redacted_secrets(tmp_path):
+    store = ConfigStore(tmp_path)
+    store.update({
+        "configured": True,
+        "interceptor": {"enabled": False, "manage_without_debrid": False},
+        "qbt": {"password": "secret-pw"},
+        "desktop": {"notifications": True},
+    })
+
+    app = create_app(store)
+    with TestClient(app) as client:
+        client.post("/api/config", json={"desktop": {"notifications": False}})
+    assert store.config.qbt.password == "secret-pw"
+    assert store.config.desktop.notifications is False
+
+
 def test_interceptor_nudge_endpoint(tmp_path):
     store = ConfigStore(tmp_path)
     store.update({

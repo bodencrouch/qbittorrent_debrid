@@ -51,6 +51,75 @@ DEFAULT_QUALITY_ORDER = [
 PROVISIONAL_NAME = "config.provisional.yaml"
 REDACTED = "********"
 
+# Soft config keys: persist + refresh notifier, but do not tear down / rebind
+# qBittorrent client or interceptor. Unknown top-level keys → hard (safe default).
+# Tray autostart stays on POST /api/config/tray-autostart (OS side effect).
+_SOFT_TOP_LEVEL = frozenset({
+    "configured",
+    "desktop",
+    "updates",
+    "matcher",
+    "duplicates",
+    "quality",
+})
+
+# Interceptor knobs read live from ConfigStore each scan. ``enabled`` is
+# structural (start/stop lifecycle) and forces a hard rebind.
+_SOFT_INTERCEPTOR_KEYS = frozenset({
+    "poll_seconds",
+    "sync_poll_seconds",
+    "health_scan_seconds",
+    "cache_only_categories",
+    "cache_only_on_add",
+    "cache_only_remove_torrent",
+    "local_only_categories",
+    "provider_round_robin",
+    "category_filter",
+    "fallback_to_torrent",
+    "max_wait_minutes",
+    "remove_original",
+    "download_dir",
+    "max_parallel_downloads",
+    "manage_without_debrid",
+    "delivery_mode",
+    "stalled_only",
+    "stalled_min_minutes",
+    "min_stalled_seeds",
+    "max_stalled_download_speed",
+    "max_stalled_availability",
+    "max_debrid_per_scan",
+    "stalled_queue_confirmation_passes",
+    "skip_private",
+    "require_magnet",
+    "tag_candidates",
+    "reannounce_before_debrid",
+    "reannounce_cooldown_minutes",
+    "metadata_handoff",
+    "metadata_sources",
+    "metadata_fetch_timeout_seconds",
+    "metadata_wait_seconds",
+})
+
+
+def config_patch_is_soft(patch: dict[str, Any]) -> bool:
+    """Return True when *patch* can apply without qbt/interceptor rebind."""
+    if not isinstance(patch, dict) or not patch:
+        return False
+    for key, value in patch.items():
+        if key in _SOFT_TOP_LEVEL:
+            continue
+        if key == "interceptor":
+            if not isinstance(value, dict):
+                return False
+            if not value:
+                continue
+            if not set(value.keys()).issubset(_SOFT_INTERCEPTOR_KEYS):
+                return False
+            continue
+        # qbt / server / providers / anonymity / automation / unknown → hard
+        return False
+    return True
+
 
 class ServerConfig(BaseModel):
     host: str = "127.0.0.1"

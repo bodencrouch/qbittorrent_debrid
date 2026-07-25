@@ -47,11 +47,11 @@ Nested keys use `__` (double underscore): `QBX_INTERCEPTOR__STALLED_MIN_MINUTES=
 
 ## Desktop extras
 
-In Control Shell → **Settings** → Application:
+In Control Shell → **Settings**:
 
-- **Update channel / GitHub source** — check-only; see [UPDATES.md](UPDATES.md)
-- **Desktop notifications** — allowlisted events only
-- **Start tray at login** — writes `~/.config/autostart/qbx-tray.desktop` right away (dedicated API; not a silent side effect of Save)
+- **Connection / Providers / Anonymity** — dirty · Discard · Save (rebinds qBittorrent / debrid)
+- **Interceptor / Matcher** — apply immediately (soft prefs do not tear down the daemon)
+- **Application** — update channel / GitHub source (check-only; see [UPDATES.md](UPDATES.md)), desktop notifications (immediate), tray at login (dedicated API; OS sync)
 
 ## Docker note
 

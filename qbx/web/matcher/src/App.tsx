@@ -6,8 +6,11 @@ import { Badge } from "@/components/ui/badge"
 import { TorrentGrid } from "@/components/TorrentGrid"
 import { WorkspaceTabs, type TabId } from "@/components/WorkspaceTabs"
 import { LogPanel } from "@/components/LogPanel"
-import { SettingsPanel } from "@/components/SettingsPanel"
+import { SettingsPanel, type SettingsSection } from "@/components/SettingsPanel"
+import { CommandBar } from "@/components/CommandBar"
+import { CommandPalette } from "@/components/CommandPalette"
 import { ControlApi, type HealthInfo, type TorrentInfo } from "@/api/backend"
+import type { ActionContext } from "@/lib/actions"
 import { getErrorMessage } from "@/lib/utils"
 import { toast } from "sonner"
 import type { ContextMenuAction } from "@/components/TorrentContextMenu"
@@ -20,13 +23,39 @@ function readQuery(): { view?: string; hash?: string } {
   }
 }
 
+type HealthState = "loading" | "online" | "offline" | "partial"
+
+function healthState(health: HealthInfo | null, everLoaded: boolean): HealthState {
+  if (!everLoaded && !health) return "loading"
+  if (!health) return "offline"
+  if (health.ok) return "online"
+  // Reachable API but unhealthy stack (qbt/debrid/interceptor issues).
+  return "partial"
+}
+
+function healthBadge(state: HealthState): { label: string; variant: "default" | "destructive" | "outline" | "secondary" } {
+  switch (state) {
+    case "loading":
+      return { label: "loading", variant: "secondary" }
+    case "online":
+      return { label: "online", variant: "default" }
+    case "partial":
+      return { label: "partial", variant: "outline" }
+    case "offline":
+      return { label: "offline", variant: "destructive" }
+  }
+}
+
 export default function App() {
   const query = useMemo(() => readQuery(), [])
   const [health, setHealth] = useState<HealthInfo | null>(null)
+  const [healthEverLoaded, setHealthEverLoaded] = useState(false)
   const [selected, setSelected] = useState<TorrentInfo | null>(null)
   const [refreshKey, setRefreshKey] = useState(0)
   const [highlight, setHighlight] = useState<Set<string>>(new Set())
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsSection, setSettingsSection] = useState<SettingsSection | undefined>()
+  const [paletteOpen, setPaletteOpen] = useState(false)
   const [workspaceTab, setWorkspaceTab] = useState<TabId>(
     query.view === "match" ? "match" : query.view === "debrid" ? "debrid" : "overview",
   )
@@ -38,8 +67,11 @@ export default function App() {
     try {
       const h = await ControlApi.health()
       setHealth(h)
+      setHealthEverLoaded(true)
     } catch (err) {
       console.warn(err)
+      setHealth(null)
+      setHealthEverLoaded(true)
     }
   }, [])
 
@@ -49,8 +81,6 @@ export default function App() {
     return () => window.clearInterval(id)
   }, [refreshHealth])
 
-  // One startup update check per browser session; only toasts when something
-  // is actionable (update available). Silent on errors/up-to-date.
   useEffect(() => {
     if (sessionStorage.getItem("qbx_update_checked")) return
     let cancelled = false
@@ -111,6 +141,30 @@ export default function App() {
     else setWorkspaceTab("overview")
   }
 
+  const openSettings = useCallback((section?: string) => {
+    if (section) setSettingsSection(section as SettingsSection)
+    else setSettingsSection(undefined)
+    setSettingsOpen(true)
+  }, [])
+
+  const actionCtx: ActionContext = useMemo(
+    () => ({
+      torrent: selected,
+      health,
+      openSettings,
+      onNavigate: (tab, torrent) => {
+        onSelect(torrent)
+        setWorkspaceTab(tab)
+      },
+      onActionDone: () => {
+        setRefreshKey((k) => k + 1)
+        void refreshHealth()
+      },
+      refreshHealth,
+    }),
+    [selected, health, openSettings, refreshHealth],
+  )
+
   const toggleInterceptor = async () => {
     try {
       if (health?.interceptor_running) {
@@ -126,16 +180,15 @@ export default function App() {
     }
   }
 
-  const openWebUi = () => {
-    window.open("/qbt/", "_blank", "noopener,noreferrer")
-  }
+  const hState = healthState(health, healthEverLoaded)
+  const hBadge = healthBadge(hState)
 
   return (
     <div className="h-screen flex flex-col bg-background text-foreground dark">
       <header className="flex items-center gap-3 border-b border-border px-4 py-2 bg-card/50 shrink-0">
         <h1 className="text-sm font-bold tracking-[0.2em]">QBX</h1>
-        <Badge variant={health?.ok ? "default" : "destructive"} className="text-[10px]">
-          {health?.ok ? "online" : "…"}
+        <Badge variant={hBadge.variant} className="text-[10px]">
+          {hBadge.label}
         </Badge>
         <Badge variant="outline" className="text-[10px]">
           debrid {health?.debrid_enabled ? "on" : "off"}
@@ -150,47 +203,39 @@ export default function App() {
           <Button
             size="sm"
             variant="outline"
-            className="h-7 text-xs"
-            onClick={async () => {
-              try {
-                await ControlApi.interceptorScan()
-                toast.success("Policy scan started")
-                setRefreshKey((k) => k + 1)
-              } catch (err) {
-                toast.error(getErrorMessage(err))
-              }
-            }}
+            className="h-7 text-xs font-mono"
+            onClick={() => setPaletteOpen(true)}
+            title="Command palette (⌘K / Ctrl+K)"
           >
-            Scan now
-          </Button>
-          <Button
-            size="sm"
-            variant="outline"
-            className="h-7 text-xs"
-            onClick={openWebUi}
-            title="Open the full qBittorrent WebUI in a new browser window (proxied at /qbt/)"
-          >
-            Open WebUI
+            ⌘K
           </Button>
           <Button
             size="sm"
             variant={settingsOpen ? "default" : "outline"}
             className="h-7 text-xs"
-            onClick={() => setSettingsOpen((v) => !v)}
+            onClick={() => openSettings()}
           >
             Settings
           </Button>
         </div>
       </header>
 
+      <CommandBar ctx={actionCtx} />
+
       <SettingsPanel
         open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
+        initialSection={settingsSection}
+        onClose={() => {
+          setSettingsOpen(false)
+          setSettingsSection(undefined)
+        }}
         onSaved={() => {
           void refreshHealth()
           setRefreshKey((k) => k + 1)
         }}
       />
+
+      <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} ctx={actionCtx} />
 
       <div className="flex-1 min-h-0">
         <Group orientation="vertical" className="h-full" {...verticalLayout}>

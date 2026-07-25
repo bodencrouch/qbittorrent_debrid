@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { ControlApi, QBitService, type TorrentInfo } from "@/api/backend"
+import { findAction, type ActionContext } from "@/lib/actions"
 import { getErrorMessage } from "@/lib/utils"
 import { toast } from "sonner"
 
@@ -108,6 +109,35 @@ export function TorrentContextMenu({
       setBusy(false)
     }
   }
+
+  const actionCtx: ActionContext = {
+    torrent,
+    health: null,
+    onNavigate: (tab, t) => onNavigate?.(tab === "match" ? "match" : tab === "debrid" ? "debrid" : "overview", t),
+    onActionDone,
+  }
+
+  const catalogIds = ["force-debrid", "nudge", "retry", "skip-auto", "allow-auto", "match-files", "show-overview", "open-webui"] as const
+  const catalogItems: Item[] = catalogIds.flatMap((id) => {
+    const action = findAction(id)
+    if (!action) return []
+    const reason = action.disabledReason?.(actionCtx) ?? null
+    // Hide Allow auto when not skipped (and Skip when already skipped) for a thinner menu.
+    if (reason && (id === "allow-auto" || id === "skip-auto")) return []
+    return [
+      {
+        kind: "item" as const,
+        id: action.id,
+        label: `qbx: ${action.label}`,
+        disabled: !!reason,
+        run: () =>
+          run(async () => {
+            if (reason) throw new Error(reason)
+            await action.run(actionCtx)
+          }, `${action.label} queued`),
+      },
+    ]
+  })
 
   const items: Item[] = [
     {
@@ -229,57 +259,7 @@ export function TorrentContextMenu({
       ],
     },
     { kind: "sep", id: "sep-qbx" },
-    {
-      kind: "item",
-      id: "forceDebrid",
-      label: "qbx: Force debrid",
-      run: () => run(() => ControlApi.intercept(torrent.hash), "Force debrid queued"),
-    },
-    {
-      kind: "item",
-      id: "nudge",
-      label: "qbx: Nudge policy",
-      run: () => run(() => ControlApi.nudge(torrent.hash), "Policy nudge queued"),
-    },
-    {
-      kind: "item",
-      id: "retry",
-      label: "qbx: Retry failed",
-      run: () => run(() => ControlApi.retry(torrent.hash), "Retry queued"),
-    },
-    {
-      kind: "item",
-      id: "skip",
-      label: "qbx: Skip auto-debrid",
-      run: () => run(() => ControlApi.skipAuto(torrent.hash), "Tagged qbx-skip"),
-    },
-    {
-      kind: "item",
-      id: "match",
-      label: "qbx: Match files",
-      run: () => {
-        onNavigate?.("match", torrent)
-        onClose()
-      },
-    },
-    {
-      kind: "item",
-      id: "openShell",
-      label: "qbx: Show in workspace",
-      run: () => {
-        onNavigate?.("overview", torrent)
-        onClose()
-      },
-    },
-    {
-      kind: "item",
-      id: "openQbt",
-      label: "Open in qBittorrent WebUI",
-      run: () => {
-        window.open(`/qbt/#/transfer|${torrent.hash}`, "_blank", "noopener,noreferrer")
-        onClose()
-      },
-    },
+    ...catalogItems,
   ]
 
   return (
