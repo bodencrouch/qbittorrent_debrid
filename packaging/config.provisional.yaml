@@ -60,8 +60,8 @@ anonymity:
 # release — it never downloads or applies binaries. Empty source = disabled.
 updates:
   channel: stable        # stable | beta (beta accepts prereleases)
-  source_owner: ""       # e.g. youruser
-  source_repo: ""        # e.g. qbx
+  source_owner: bodencrouch
+  source_repo: qbittorrent_debrid
   check_on_startup: true
 
 desktop:

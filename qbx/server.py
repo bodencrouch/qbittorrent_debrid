@@ -247,12 +247,14 @@ def _register_routes(app: FastAPI) -> None:
     @app.get("/api/version")
     async def version(request: Request):
         cfg = request.app.state.qbx.store.config.updates
+        owner, repo = cfg.effective_source()
         return {
             "ok": True,
             "app": "qbx",
             "version": __version__,
             "channel": cfg.channel,
-            "source": {"owner": cfg.source_owner, "repo": cfg.source_repo},
+            "source": {"owner": owner, "repo": repo},
+            "homepage": "https://bodecloud.com/qbittorrent_debrid",
             "check_on_startup": cfg.check_on_startup,
         }
 

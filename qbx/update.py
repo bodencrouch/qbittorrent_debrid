@@ -15,7 +15,11 @@ from typing import Any
 import httpx
 
 from . import __version__
-from .config import UpdatesConfig
+from .config import (
+    DEFAULT_UPDATE_SOURCE_OWNER,
+    DEFAULT_UPDATE_SOURCE_REPO,
+    UpdatesConfig,
+)
 
 GITHUB_API = "https://api.github.com"
 _SOURCE_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
@@ -55,12 +59,17 @@ def compare_versions(a: str, b: str) -> int:
     return -1 if ra < rb else 1
 
 
-def _validate_source(cfg: UpdatesConfig) -> str | None:
-    if not cfg.source_owner or not cfg.source_repo:
-        return "update source not configured (set updates.source_owner / updates.source_repo)"
-    if not _SOURCE_RE.match(cfg.source_owner) or not _SOURCE_RE.match(cfg.source_repo):
+def _resolve_source(cfg: UpdatesConfig) -> tuple[str, str] | str:
+    """Return (owner, repo) or an error string."""
+    owner, repo = cfg.effective_source()
+    if not owner or not repo:
+        return (
+            "update source not configured "
+            f"(expected {DEFAULT_UPDATE_SOURCE_OWNER}/{DEFAULT_UPDATE_SOURCE_REPO})"
+        )
+    if not _SOURCE_RE.match(owner) or not _SOURCE_RE.match(repo):
         return "invalid update source (owner/repo contains unexpected characters)"
-    return None
+    return owner, repo
 
 
 async def _fetch_releases(owner: str, repo: str, client: httpx.AsyncClient | None = None) -> list[dict]:
@@ -105,6 +114,22 @@ async def check_for_update(
     current: str = __version__,
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
+    resolved = _resolve_source(cfg)
+    if isinstance(resolved, str):
+        return {
+            "ok": False,
+            "update_available": False,
+            "downgrade": False,
+            "current": current,
+            "latest": None,
+            "channel": cfg.channel,
+            "source": {"owner": cfg.source_owner, "repo": cfg.source_repo},
+            "release": None,
+            "guided_commands": [],
+            "error": resolved,
+        }
+
+    owner, repo = resolved
     base: dict[str, Any] = {
         "ok": False,
         "update_available": False,
@@ -112,19 +137,14 @@ async def check_for_update(
         "current": current,
         "latest": None,
         "channel": cfg.channel,
-        "source": {"owner": cfg.source_owner, "repo": cfg.source_repo},
+        "source": {"owner": owner, "repo": repo},
         "release": None,
         "guided_commands": [],
         "error": None,
     }
 
-    err = _validate_source(cfg)
-    if err:
-        base["error"] = err
-        return base
-
     try:
-        releases = await _fetch_releases(cfg.source_owner, cfg.source_repo, client=client)
+        releases = await _fetch_releases(owner, repo, client=client)
     except (LookupError, ConnectionError) as exc:
         base["error"] = str(exc)
         return base

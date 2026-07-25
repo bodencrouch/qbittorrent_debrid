@@ -89,6 +89,13 @@ class InterceptorConfig(BaseModel):
     poll_seconds: int = 15
     sync_poll_seconds: int = 5
     health_scan_seconds: int = 60
+    # Categories that cache on debrid at add-time (no local download).
+    cache_only_categories: list[str] = Field(default_factory=list)
+    cache_only_on_add: bool = False
+    cache_only_remove_torrent: bool = True
+    # Never send these categories to debrid cache (manual/local grabs).
+    local_only_categories: list[str] = Field(default_factory=lambda: ["manual", ""])
+    provider_round_robin: bool = False
     # Only intercept torrents in this category ("" = all torrents).
     category_filter: str = ""
     fallback_to_torrent: bool = True
@@ -197,14 +204,26 @@ DEFAULT_NOTIFY_KINDS = [
 ]
 
 
+# Upstream release source — used when config leaves owner/repo blank (common after
+# older installs seeded empty strings into config.toml).
+DEFAULT_UPDATE_SOURCE_OWNER = "bodencrouch"
+DEFAULT_UPDATE_SOURCE_REPO = "qbittorrent_debrid"
+
+
 class UpdatesConfig(BaseModel):
     """Check-only updates: qbx never applies binaries for source/venv installs."""
 
     channel: Literal["stable", "beta"] = "stable"
-    # GitHub source, e.g. owner="youruser", repo="qbx". Empty = checks disabled.
-    source_owner: str = ""
-    source_repo: str = ""
+    # Defaults to the public upstream repo. Blank values still resolve to these
+    # via ``effective_source()`` so older empty config.toml entries keep working.
+    source_owner: str = DEFAULT_UPDATE_SOURCE_OWNER
+    source_repo: str = DEFAULT_UPDATE_SOURCE_REPO
     check_on_startup: bool = True
+
+    def effective_source(self) -> tuple[str, str]:
+        owner = (self.source_owner or DEFAULT_UPDATE_SOURCE_OWNER).strip()
+        repo = (self.source_repo or DEFAULT_UPDATE_SOURCE_REPO).strip()
+        return owner, repo
 
 
 class DesktopConfig(BaseModel):

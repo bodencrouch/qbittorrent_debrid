@@ -91,8 +91,9 @@ function fromConfig(cfg: Record<string, unknown>): SettingsForm {
     strip_trackers: anonymity.strip_trackers !== false,
     providers,
     update_channel: updates.channel === "beta" ? "beta" : "stable",
-    update_source_owner: String(updates.source_owner || ""),
-    update_source_repo: String(updates.source_repo || ""),
+    // Blank values (older installs) fall back to the public upstream repo.
+    update_source_owner: String(updates.source_owner || "bodencrouch"),
+    update_source_repo: String(updates.source_repo || "qbittorrent_debrid"),
     update_check_on_startup: updates.check_on_startup !== false,
     desktop_notifications: desktop.notifications !== false,
     tray_autostart: Boolean(desktop.tray_autostart),
@@ -182,6 +183,9 @@ export function SettingsPanel({ open, onClose, onSaved }: SettingsPanelProps) {
         toast.error(res.error || "Update check failed")
       } else if (res.update_available) {
         toast.info(`qbx ${res.latest} is available`)
+      } else if (res.error) {
+        // e.g. "no stable releases published yet" — not a hard failure
+        toast.message(res.error)
       } else {
         toast.success("qbx is up to date")
       }
@@ -535,13 +539,13 @@ export function SettingsPanel({ open, onClose, onSaved }: SettingsPanelProps) {
                         className="h-8 text-xs font-mono"
                         value={form.update_source_owner}
                         onChange={(e) => setForm({ ...form, update_source_owner: e.target.value })}
-                        placeholder="owner"
+                        placeholder="bodencrouch"
                       />
                       <Input
                         className="h-8 text-xs font-mono"
                         value={form.update_source_repo}
                         onChange={(e) => setForm({ ...form, update_source_repo: e.target.value })}
-                        placeholder="repo"
+                        placeholder="qbittorrent_debrid"
                       />
                     </div>
                   </div>
@@ -609,8 +613,25 @@ export function SettingsPanel({ open, onClose, onSaved }: SettingsPanelProps) {
                   Start tray at login (applies immediately)
                 </label>
                 <p className="text-[10px] text-muted-foreground max-w-md">
-                  Updates are check-only: qbx links to the GitHub release and shows the
-                  reinstall commands — nothing is downloaded or applied automatically.
+                  Defaults to{" "}
+                  <a
+                    className="text-sky-400 underline"
+                    href="https://github.com/bodencrouch/qbittorrent_debrid"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    bodencrouch/qbittorrent_debrid
+                  </a>
+                  {" "}(
+                  <a
+                    className="text-sky-400 underline"
+                    href="https://bodecloud.com/qbittorrent_debrid"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    bodecloud.com/qbittorrent_debrid
+                  </a>
+                  ). Checks are check-only — nothing is downloaded or applied automatically.
                 </p>
               </div>
             </div>

@@ -98,10 +98,26 @@ async def test_drafts_are_ignored():
     assert res["latest"] == "0.2.0"
 
 
-async def test_unconfigured_source_returns_error_not_crash():
-    res = await check_for_update(UpdatesConfig())
-    assert res["ok"] is False
-    assert "not configured" in res["error"]
+async def test_default_source_is_upstream_bodencrouch():
+    cfg = UpdatesConfig()
+    assert cfg.effective_source() == ("bodencrouch", "qbittorrent_debrid")
+    # Explicit blanks (older config.toml) still resolve to upstream.
+    blank = UpdatesConfig(source_owner="", source_repo="")
+    assert blank.effective_source() == ("bodencrouch", "qbittorrent_debrid")
+
+
+async def test_blank_source_uses_default_and_checks(monkeypatch):
+    cfg = UpdatesConfig(source_owner="", source_repo="")
+
+    async def handler(request):
+        assert "/bodencrouch/qbittorrent_debrid/" in str(request.url)
+        return _releases_response([{"tag_name": "v0.2.0", "prerelease": False}])
+
+    async with _client(handler) as client:
+        res = await check_for_update(cfg, current="0.1.0", client=client)
+    assert res["ok"] is True
+    assert res["source"] == {"owner": "bodencrouch", "repo": "qbittorrent_debrid"}
+    assert res["update_available"] is True
 
 
 async def test_invalid_source_rejected():
