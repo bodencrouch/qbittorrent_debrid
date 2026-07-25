@@ -426,6 +426,30 @@ export const QbtServiceExt = {
     const r = await api<{ save_paths: string[] }>("/api/qbt/save-paths");
     return r.save_paths;
   },
+
+  async RenameFile(hash: string, oldPath: string, newPath: string): Promise<{
+    ok: boolean;
+    hash: string;
+    old_path: string;
+    new_path: string;
+  }> {
+    return api("/api/qbt/rename-file", {
+      method: "POST",
+      body: JSON.stringify({ hash, old_path: oldPath, new_path: newPath }),
+    });
+  },
+
+  async RenameFolder(hash: string, oldPath: string, newPath: string): Promise<{
+    ok: boolean;
+    hash: string;
+    old_path: string;
+    new_path: string;
+  }> {
+    return api("/api/qbt/rename-folder", {
+      method: "POST",
+      body: JSON.stringify({ hash, old_path: oldPath, new_path: newPath }),
+    });
+  },
 };
 
 /** Integration contract checks (paths, writability, qBT alignment). */
