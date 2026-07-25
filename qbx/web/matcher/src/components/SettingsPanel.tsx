@@ -621,8 +621,8 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
         <DialogHeader className="px-4 pt-4 pb-2 border-b border-border shrink-0 space-y-1">
           <DialogTitle className="text-sm font-semibold tracking-wide">Settings</DialogTitle>
           <DialogDescription className="text-[11px]">
-            Connection, providers, and anonymity require Save. Interceptor, matcher, and application
-            prefs apply as you change them. Tray autostart uses its own OS sync.
+            Connection, Providers, and Anonymity require explicit Save. Interceptor, Matcher, Content Dupes, 
+            and Application prefs apply automatically as you change them. Tray autostart uses its own OS sync.
           </DialogDescription>
         </DialogHeader>
 
@@ -1335,16 +1335,16 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
               )}
             </div>
 
-            {(section === "connection" || section === "providers" || section === "anonymity") && (
-              <div className="shrink-0 border-t border-border px-4 py-2 flex items-center gap-2 bg-card/40">
+            {dirtySave && (
+              <div className="shrink-0 border-t border-border px-4 py-2 flex items-center gap-2 bg-amber-500/10">
                 <span className="text-[11px] text-muted-foreground flex-1">
-                  {dirtySave ? "Unsaved changes" : "No unsaved changes"}
+                  Unsaved changes in Connection, Providers, or Anonymity
                 </span>
                 <Button
                   size="sm"
                   variant="ghost"
                   className="h-7 text-xs"
-                  disabled={!dirtySave || busy}
+                  disabled={busy}
                   onClick={discardSave}
                 >
                   Discard
@@ -1352,7 +1352,7 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
                 <Button
                   size="sm"
                   className="h-7 text-xs"
-                  disabled={!dirtySave || busy || !form}
+                  disabled={busy || !form}
                   onClick={() => void saveHard()}
                 >
                   {busy ? "Saving…" : "Save"}

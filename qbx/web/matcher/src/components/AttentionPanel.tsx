@@ -18,6 +18,7 @@ type AttentionPanelProps = {
   onOpenStorage?: () => void
   onOpenTorrents?: () => void
   onRefreshHealth?: () => void
+  onOpenMatcher?: () => void
 }
 
 function severityBadge(severity: AttentionItem["severity"]) {
@@ -35,6 +36,7 @@ export function AttentionPanel({
   onOpenSettings,
   onOpenStorage,
   onOpenTorrents,
+  onOpenMatcher,
   onRefreshHealth,
 }: AttentionPanelProps) {
   const [payload, setPayload] = useState<AttentionPayload | null>(null)

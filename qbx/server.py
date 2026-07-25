@@ -378,6 +378,7 @@ def _register_routes(app: FastAPI) -> None:
             and state.automation.running
             and contract["status"] == "ok"
         )
+        server_cfg = state.store.config.server
         return {
             "ok": ok,
             "app": "qbx",
@@ -396,6 +397,10 @@ def _register_routes(app: FastAPI) -> None:
             "boot_id": state.boot_id,
             "contract": contract,
             "attention": attention,
+            "server_info": {
+                "host": server_cfg.host,
+                "port": server_cfg.port,
+            },
             "links": {
                 "dashboard": "/",
                 "qbittorrent_webui": "/qbt/",
@@ -1020,6 +1025,46 @@ def _register_routes(app: FastAPI) -> None:
             dry_run=dry_run,
         )
         return result
+
+    @app.get("/api/matcher/rules", dependencies=[guard])
+    async def matcher_rules_get(request: Request):
+        """Get all matcher rules."""
+        state: AppState = request.app.state.qbx
+        return {"rules": state.store.config.matcher.rules}
+
+    @app.post("/api/matcher/rules", dependencies=[guard])
+    async def matcher_rules_update(request: Request, rules: list):
+        """Replace all matcher rules."""
+        state: AppState = request.app.state.qbx
+        state.store.update({"matcher": {"rules": rules}})
+        return {"ok": True, "rules": state.store.config.matcher.rules}
+
+    @app.get("/api/qbt/categories", dependencies=[guard])
+    async def qbt_categories(request: Request):
+        """Get all qBittorrent categories."""
+        state: AppState = request.app.state.qbx
+        try:
+            torrents = await state.qbt.get_torrents()
+            categories = sorted(set(t.category for t in torrents if t.category))
+            return {"categories": categories}
+        except QbtError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/api/qbt/save-paths", dependencies=[guard])
+    async def qbt_save_paths(request: Request):
+        """Get all qBittorrent save paths."""
+        state: AppState = request.app.state.qbx
+        try:
+            prefs = await state.qbt.preferences()
+            paths = [prefs.get("default_save_path", "")]
+            alt_paths_str = prefs.get("save_paths", "")
+            if alt_paths_str:
+                paths.extend(alt_paths_str.split('|'))
+            # Filter out empty strings
+            paths = [p for p in paths if p]
+            return {"save_paths": sorted(set(paths))}
+        except QbtError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.post("/api/storage/scan", dependencies=[guard])
     async def storage_scan(request: Request):

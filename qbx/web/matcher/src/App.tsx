@@ -9,6 +9,7 @@ import { LogPanel } from "@/components/LogPanel"
 import { SettingsPanel, type SettingsSection } from "@/components/SettingsPanel"
 import { StoragePanel } from "@/components/StoragePanel"
 import { OverviewPanel } from "@/components/OverviewPanel"
+import { MatcherSurface } from "@/components/MatcherSurface"
 import { CommandBar } from "@/components/CommandBar"
 import { CommandPalette } from "@/components/CommandPalette"
 import { ControlApi, type HealthInfo, type TorrentInfo } from "@/api/backend"
@@ -27,12 +28,13 @@ function readQuery(): { view?: string; hash?: string } {
 
 type HealthState = "loading" | "online" | "offline" | "partial"
 
-/** Shell-level surface. Storage is torrent-independent, so it cannot live in
- * WorkspaceTabs (those require a selected torrent). */
-type Surface = "overview" | "torrents" | "storage"
+// Shell-level surface. Storage and Matcher are torrent-independent, so they cannot live in
+// * WorkspaceTabs (those require a selected torrent).
+type Surface = "overview" | "torrents" | "storage" | "matcher";
 
 function initialSurface(view?: string): Surface {
   if (view === "storage") return "storage"
+  if (view === "matcher") return "matcher"
   if (view === "torrents" || view === "match" || view === "debrid") return "torrents"
   return "overview"
 }
@@ -258,7 +260,33 @@ export default function App() {
           >
             Storage
           </Button>
+          <Button
+            size="sm"
+            variant={surface === "matcher" ? "default" : "outline"}
+            className="h-7 text-xs"
+            aria-current={surface === "matcher" ? "page" : undefined}
+            onClick={() => setSurface("matcher")}
+          >
+            Matcher
+          </Button>
         </nav>
+        {health?.server_info && (
+          <Badge variant="outline" className="text-[10px] font-mono ml-2">
+            {health.server_info.host}:{health.server_info.port}
+          </Badge>
+        )}
+        {health?.links?.qbittorrent_webui && (
+          <a
+            href={health.links.qbittorrent_webui}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="ml-2"
+          >
+            <Button size="sm" variant="outline" className="h-7 text-xs">
+              Open qBittorrent
+            </Button>
+          </a>
+        )}
         <div className="ml-auto flex items-center gap-2">
           <Button size="sm" variant="outline" className="h-7 text-xs" onClick={toggleInterceptor}>
             {health?.interceptor_running ? "Stop interceptor" : "Start interceptor"}
@@ -272,6 +300,18 @@ export default function App() {
           >
             ⌘K
           </Button>
+          {!health?.configured && (
+            <Button
+              size="sm"
+              variant="destructive"
+              className="h-7 text-xs"
+              onClick={() => {
+                toast.error("qbx is not configured yet. Run: qbx setup");
+              }}
+            >
+              Setup Required
+            </Button>
+          )}
           <Button
             size="sm"
             variant={settingsOpen ? "default" : "outline"}
@@ -309,10 +349,13 @@ export default function App() {
                 onOpenSettings={openSettings}
                 onOpenStorage={() => setSurface("storage")}
                 onOpenTorrents={() => setSurface("torrents")}
+                onOpenMatcher={() => setSurface("matcher")}
                 onRefreshHealth={() => void refreshHealth()}
               />
             ) : surface === "storage" ? (
               <StoragePanel />
+            ) : surface === "matcher" ? (
+              <MatcherSurface health={health} />
             ) : (
             <Group orientation="horizontal" className="h-full" {...horizontalLayout}>
               <Panel id="grid" defaultSize="55" minSize="30">
