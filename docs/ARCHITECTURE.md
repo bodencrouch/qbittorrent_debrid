@@ -26,6 +26,15 @@ FastAPI daemon (qbx serve)  ←→  qBittorrent WebAPI
 | **Matcher** | Manual size rematch; optional content-hash placement |
 | **Storage service** | Single-flight content-duplicate scans; hardlink / quarantine reclaim |
 | **Config store** | Encrypted secrets in `~/.config/qbx/config.toml` |
+| **Integration contract** | Path/disk/qBittorrent checks; hard fails block mutating APIs (409) |
+| **Attention feed** | Aggregates contract + storage signals for the Overview queue |
+
+## Control Shell information architecture
+
+- **Overview** is the default surface: needs-attention queue, integration health summary, interceptor monitor, matcher activity.
+- **Torrents** and **Storage** are separate workspaces; storage scans are independent of the active torrent.
+- **Settings** holds configuration; contract snoozes apply to soft warnings only.
+- When `server.api_token` is set, `/api/health` stays public for liveness but exposes `attention_requires_token`; `/api/attention` requires the token.
 
 ## Delivery modes
 
@@ -47,6 +56,8 @@ If qBittorrent is stuck without a file tree (`metaDL` / missing metadata), qbx c
 
 ## Related code
 
+- `qbx/contract.py` — integration contract checks
+- `qbx/attention.py` — attention item aggregation
 - `qbx/server.py` — HTTP surface
 - `qbx/engine/interceptor.py` — policy loop
 - `qbx/engine/metadata.py` — torrent cache fetch + SSRF checks

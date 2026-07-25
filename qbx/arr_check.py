@@ -1,12 +1,25 @@
-"""Optional read-only Sonarr/Radarr root folder alignment checks."""
+"""Optional read-only Sonarr/Radarr root folder alignment checks.
+
+Extends :func:`qbx.contract.run_checks_async` with *arr root folder
+alignment against qbx matcher/content_dupes roots, and download-namespace
+mismatch detection when qBittorrent preferences are available.
+"""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import httpx
 
 from .config import ConfigStore
-from .contract import CheckResult, _normalize_path
+from .contract import CheckResult, _normalize_path, _resolve_path
 from .engine.disk_index import under_any_root
+from .qbt import QbtClient
+
+DOCKER_DATA_HINT = (
+    "In Docker, mount one host path to /data in qBittorrent, qbx, and *arr containers "
+    "so internal paths match. Example compose volume: - /mnt/user/media:/data"
+)
 
 
 async def _fetch_root_folders(url: str, api_key: str) -> list[str]:
@@ -24,7 +37,14 @@ async def _fetch_root_folders(url: str, api_key: str) -> list[str]:
     return paths
 
 
-async def arr_contract_checks(store: ConfigStore) -> list[CheckResult]:
+async def arr_contract_checks(store: ConfigStore, qbt: QbtClient | None = None) -> list[CheckResult]:
+    """Run *arr alignment checks.
+
+    When ``qbt`` is supplied and preferences are readable, also checks
+    that the qBittorrent default or per-category save paths share a
+    namespace with at least one *arr root folder (download-namespace
+    mismatch detection).
+    """
     cfg = store.config
     arr = getattr(cfg, "arr", None)
     if arr is None:
@@ -36,6 +56,8 @@ async def arr_contract_checks(store: ConfigStore) -> list[CheckResult]:
         return []
 
     checks: list[CheckResult] = []
+    arr_folders: list[tuple[str, str]] = []
+
     for label, svc in (("sonarr", arr.sonarr), ("radarr", arr.radarr)):
         if not svc.enabled or not svc.url.strip() or not svc.api_key.strip():
             continue
@@ -65,4 +87,86 @@ async def arr_contract_checks(store: ConfigStore) -> list[CheckResult]:
                         settings_section="matcher",
                     )
                 )
+            if folder:
+                arr_folders.append((label, folder))
+
+    if qbt is not None and arr_folders:
+        try:
+            prefs = await qbt.preferences()
+        except Exception:
+            prefs = {}
+        save_path = str(prefs.get("save_path") or prefs.get("SavePath") or "").strip()
+        if save_path:
+            resolved_save = _resolve_path(_normalize_path(save_path))
+            if resolved_save is not None:
+                for label, folder in arr_folders:
+                    resolved_arr = _resolve_path(_normalize_path(folder))
+                    if resolved_arr is None:
+                        continue
+                    if not _shares_ancestor_under_roots(resolved_save, resolved_arr, roots):
+                        checks.append(
+                            CheckResult(
+                                id=f"arr_{label}_download_namespace_mismatch",
+                                severity="soft",
+                                title=f"qBittorrent save path outside {label.title()} root namespace",
+                                detail=(
+                                    f"qBT default save path {save_path} and "
+                                    f"{label.title()} root {folder} share no common ancestor "
+                                    "under configured roots."
+                                ),
+                                remediation=f"Align qBittorrent save path or {label.title()} root to the same parent. {DOCKER_DATA_HINT}",
+                                settings_section="matcher",
+                            )
+                        )
+        try:
+            cats = await qbt.categories()
+        except Exception:
+            cats = {}
+        if isinstance(cats, dict):
+            for name, meta in cats.items():
+                if not isinstance(meta, dict):
+                    continue
+                cat_path = str(meta.get("savePath") or meta.get("save_path") or "").strip()
+                if not cat_path:
+                    continue
+                resolved_cat = _resolve_path(_normalize_path(cat_path))
+                if resolved_cat is None:
+                    continue
+                for label, folder in arr_folders:
+                    resolved_arr = _resolve_path(_normalize_path(folder))
+                    if resolved_arr is None:
+                        continue
+                    if not _shares_ancestor_under_roots(resolved_cat, resolved_arr, roots):
+                        checks.append(
+                            CheckResult(
+                                id=f"arr_{label}_cat_download_namespace_mismatch:{name}",
+                                severity="soft",
+                                title=f"Category '{name}' save path outside {label.title()} root namespace",
+                                detail=(
+                                    f"Category '{name}' save path {cat_path} and "
+                                    f"{label.title()} root {folder} share no common ancestor "
+                                    "under configured roots."
+                                ),
+                                remediation=f"Align category save path or {label.title()} root. {DOCKER_DATA_HINT}",
+                                settings_section="matcher",
+                            )
+                        )
     return checks
+
+
+def _shares_ancestor_under_roots(path_a: Path, path_b: Path, roots: list[str]) -> bool:
+    """Return True if *path_a* and *path_b* share a common resolved ancestor
+    that itself falls under one of the configured *roots*."""
+    for raw in roots:
+        try:
+            root = _normalize_path(raw).resolve()
+        except OSError:
+            continue
+        if _under_path(path_a, root) and _under_path(path_b, root):
+            return True
+    return False
+
+
+def _under_path(target: Path, ancestor: Path) -> bool:
+    """Return True if *target* equals *ancestor* or is nested under it."""
+    return target == ancestor or ancestor in target.parents

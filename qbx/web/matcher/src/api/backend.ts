@@ -9,6 +9,59 @@ function tokenHeaders(): HeadersInit {
   return h;
 }
 
+type ContractBlockDetail = {
+  reason?: string;
+  primary_check?: {
+    title?: string;
+    detail?: string;
+    remediation?: string;
+  };
+};
+
+/** Turn FastAPI error bodies into operator-readable messages. */
+export function formatApiErrorDetail(
+  body: unknown,
+  fallback: string,
+): string {
+  if (!body || typeof body !== "object") {
+    return fallback;
+  }
+  const record = body as Record<string, unknown>;
+  const detail = record.detail;
+  if (typeof detail === "string" && detail.trim()) {
+    return detail;
+  }
+  if (detail && typeof detail === "object") {
+    const block = detail as ContractBlockDetail;
+    if (block.reason === "contract_blocked" && block.primary_check) {
+      const check = block.primary_check;
+      const parts = [check.title, check.detail, check.remediation].filter(
+        (part): part is string => Boolean(part && String(part).trim()),
+      );
+      if (parts.length) {
+        return parts.join(" — ");
+      }
+    }
+    if (typeof block.reason === "string" && block.reason.trim()) {
+      return block.reason;
+    }
+  }
+  if (typeof record.message === "string" && record.message.trim()) {
+    return record.message;
+  }
+  return fallback;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
 async function api<T>(path: string, opts: RequestInit = {}): Promise<T> {
   let res: Response;
   try {
@@ -24,11 +77,15 @@ async function api<T>(path: string, opts: RequestInit = {}): Promise<T> {
   }
   if (res.status === 401) {
     // Avoid window.prompt — it blocks the UI and fails in embedded/browser-preview contexts.
-    throw new Error("API token required. Open Settings and enter the token, then Save.");
+    throw new ApiError(
+      "API token required. Open Settings and enter the token, then Save.",
+      401,
+    );
   }
   if (!res.ok) {
-    const detail = await res.json().catch(() => ({}));
-    throw new Error((detail as { detail?: string }).detail || res.statusText || `HTTP ${res.status}`);
+    const body = await res.json().catch(() => ({}));
+    const fallback = res.statusText || `HTTP ${res.status}`;
+    throw new ApiError(formatApiErrorDetail(body, fallback), res.status);
   }
   if (res.status === 204) return undefined as T;
   return res.json();
@@ -82,6 +139,7 @@ export type MatchInfo = {
 export type HealthInfo = {
   ok: boolean;
   configured: boolean;
+  attention_requires_token?: boolean;
   debrid_enabled: boolean;
   interceptor_running: boolean;
   automation_running: boolean;
