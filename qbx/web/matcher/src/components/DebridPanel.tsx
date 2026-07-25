@@ -12,7 +12,6 @@ import { formatSize, getErrorMessage } from "@/lib/utils"
 import { uiLog } from "@/lib/ui-log"
 import {
   ControlApi,
-  QBitService,
   eventsUrl,
   type EventEntry,
   type HealthInfo,
@@ -331,7 +330,6 @@ export function DebridPanel({ torrent, onActionDone }: DebridPanelProps) {
 
   const progressPct = Math.min(100, Math.max(0, (t.progress || 0) * 100))
   const status = (t.qbx_status || "idle").toLowerCase()
-  const isPaused = /paused/i.test(t.state || "")
   const downloaded = Number(props.total_downloaded ?? props.downloaded ?? NaN)
   const uploaded = Number(props.total_uploaded ?? props.uploaded ?? NaN)
   const availability = Number(props.availability ?? NaN)
@@ -448,116 +446,17 @@ export function DebridPanel({ torrent, onActionDone }: DebridPanelProps) {
           </div>
         </Section>
 
-        {/* Debrid pipeline */}
+        {/* Pipeline ops live on the shared command bar / ⌘K palette */}
         <Section title="Debrid pipeline">
-          <div className="flex flex-wrap gap-1.5">
-            <TipButton
-              tip="Bypass queue gates and send this magnet to debrid now. Log: intercept.force → intercept.start → webseed.inject → intercept.done."
-              size="sm"
-              disabled={!!busy}
-              onClick={() =>
-                run(
-                  "Force debrid",
-                  "ui.force_debrid",
-                  () => ControlApi.intercept(t.hash),
-                  "Force debrid accepted — follow intercept.* / webseed.*",
-                )
-              }
-            >
-              Force debrid
-            </TipButton>
-            <TipButton
-              tip="Clear qbx-failed / qbx-skip / qbx-done, tag candidate, and queue a policy scan."
-              size="sm"
-              variant="outline"
-              disabled={!!busy}
-              onClick={() =>
-                run("Retry", "ui.retry", () => ControlApi.retry(t.hash), "Retry queued — follow scan.manual.*")
-              }
-            >
-              Clear failed + retry
-            </TipButton>
-            <TipButton
-              tip="Wake a queue-ordered policy pass (does not jump this torrent ahead of higher slots)."
-              size="sm"
-              variant="outline"
-              disabled={!!busy}
-              onClick={() =>
-                run(
-                  "Nudge policy",
-                  "ui.nudge",
-                  () => ControlApi.nudge(t.hash),
-                  "Nudge accepted — follow scan.manual.*",
-                )
-              }
-            >
-              Nudge policy
-            </TipButton>
-            <TipButton
-              tip="Tag qbx-skip so auto-debrid never picks this torrent. Force debrid still works."
-              size="sm"
-              variant="destructive"
-              disabled={!!busy || tags.includes("qbx-skip")}
-              onClick={() =>
-                run("Skip auto", "ui.skip_auto", () => ControlApi.skipAuto(t.hash), "Marked qbx-skip")
-              }
-            >
-              Skip auto
-            </TipButton>
-            <TipButton
-              tip="Remove qbx-skip so the interceptor may auto-debrid again."
-              size="sm"
-              variant="outline"
-              disabled={!!busy || !tags.includes("qbx-skip")}
-              onClick={() =>
-                run(
-                  "Allow auto",
-                  "ui.unskip",
-                  () => ControlApi.tags(t.hash, [], ["qbx-skip"]),
-                  "Removed qbx-skip",
-                )
-              }
-            >
-              Allow auto
-            </TipButton>
-          </div>
+          <p className="text-[11px] text-muted-foreground leading-relaxed">
+            Force debrid, nudge, retry, skip/allow, pause/resume, and recheck run from the action bar
+            under the header (or ⌘K / Ctrl+K). This panel tracks tags, webseeds, and status.
+          </p>
         </Section>
 
-        {/* Torrent controls */}
-        <Section title="Torrent controls">
+        {/* Clipboard / refresh helpers (not duplicated on the bar) */}
+        <Section title="Clipboard">
           <div className="flex flex-wrap gap-1.5">
-            {isPaused ? (
-              <TipButton
-                tip="Resume downloading/seeding in qBittorrent."
-                size="sm"
-                variant="outline"
-                disabled={!!busy}
-                onClick={() => run("Resume", "ui.resume", () => ControlApi.resume(t.hash))}
-              >
-                Resume
-              </TipButton>
-            ) : (
-              <TipButton
-                tip="Pause this torrent in qBittorrent (interceptor often pauses during debrid)."
-                size="sm"
-                variant="outline"
-                disabled={!!busy}
-                onClick={() => run("Pause", "ui.pause", () => ControlApi.pause(t.hash))}
-              >
-                Pause
-              </TipButton>
-            )}
-            <TipButton
-              tip="Ask qBittorrent to recheck on-disk pieces (useful after rematch/rename)."
-              size="sm"
-              variant="outline"
-              disabled={!!busy}
-              onClick={() =>
-                run("Recheck", "ui.recheck", () => QBitService.RecheckTorrent(t.hash), "Recheck requested")
-              }
-            >
-              Recheck
-            </TipButton>
             <TipButton
               tip="Copy magnet URI for this torrent."
               size="sm"
@@ -577,17 +476,6 @@ export function DebridPanel({ torrent, onActionDone }: DebridPanelProps) {
               onClick={() => copyText("Hash", t.hash)}
             >
               Copy hash
-            </TipButton>
-            <TipButton
-              tip="Open full qBittorrent WebUI in a new window (/qbt/)."
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                uiLog("ui.open_webui", `Open WebUI: ${t.name}`, t.hash)
-                window.open("/qbt/", "_blank", "noopener,noreferrer")
-              }}
-            >
-              Open WebUI
             </TipButton>
             <TipButton
               tip="Refresh torrent detail, webseeds, and interceptor snapshot now."

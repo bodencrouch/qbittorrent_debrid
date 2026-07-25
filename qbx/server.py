@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
-from .config import ConfigStore
+from .config import ConfigStore, config_patch_is_soft
 from .debrid import DebridManager
 from .desktop import DesktopNotifier, sync_tray_autostart
 from .update import check_for_update
@@ -292,8 +292,20 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.post("/api/config", dependencies=[guard])
     async def update_config(request: Request, patch: dict):
+        """Apply a config patch.
+
+        Soft patches (desktop/updates/matcher + non-structural interceptor knobs)
+        persist and refresh the notifier only — no qBittorrent/interceptor tear-down.
+        Hard patches (qbt, api_token, providers, anonymity, interceptor.enabled, …)
+        keep the historical full rebind path. Unknown top-level keys are hard.
+        """
         state: AppState = request.app.state.qbx
+        soft = config_patch_is_soft(patch)
         cfg = state.store.update(patch)
+        state.notifier.configure(cfg.desktop.notifications, cfg.desktop.notify_kinds)
+        if soft:
+            return state.store.redacted()
+
         await state.interceptor.stop()
         await state.automation.stop()
         old_qbt = state.qbt
@@ -303,7 +315,6 @@ def _register_routes(app: FastAPI) -> None:
         state.interceptor.rebind(state.qbt, state.debrid)
         state.automation.rebind(state.qbt)
         state.automation.set_policy_runner(state.interceptor.scan_once)
-        state.notifier.configure(cfg.desktop.notifications, cfg.desktop.notify_kinds)
         if cfg.interceptor.enabled and (state.debrid.enabled or cfg.interceptor.manage_without_debrid):
             state.interceptor.start()
         if cfg.automation.watch_folders:

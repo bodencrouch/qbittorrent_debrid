@@ -51,9 +51,11 @@ Open **http://127.0.0.1:8484**.
 | `/qbt/` | Full qBittorrent WebUI (proxied + qbx inject) |
 | `/?view=match` | Jump to the match workspace |
 
+In the Control Shell: select a torrent and use the **action bar** under the header (Force debrid, Nudge, Retry, …), or press **⌘K / Ctrl+K** for the command palette. **Settings** is a dialog with a section rail — Connection / Providers / Anonymity need Save; Interceptor / Matcher / Application apply as you change them.
+
 ## 5. See it work
 
-1. Leave a torrent stalled long enough (defaults are conservative), **or** select it and nudge / intercept from the UI.
+1. Leave a torrent stalled long enough (defaults are conservative), **or** select it and Force debrid / Nudge from the action bar (or ⌘K).
 2. Watch the event log for debrid steps.
 3. Confirm webseeds appear on the torrent in qBittorrent.
 

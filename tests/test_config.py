@@ -9,6 +9,7 @@ from qbx.config import (
     ConfigStore,
     apply_provider_env_keys,
     cli_overrides_from_args,
+    config_patch_is_soft,
     env_overrides,
 )
 
@@ -193,3 +194,19 @@ def test_defaults_include_webseed_delivery(tmp_path):
     store = ConfigStore(tmp_path)
     assert store.config.interceptor.delivery_mode == "webseed"
     assert store.config.interceptor.stalled_only is True
+
+
+def test_config_patch_is_soft_classification():
+    assert config_patch_is_soft({"desktop": {"notifications": False}})
+    assert config_patch_is_soft({"updates": {"check_on_startup": False, "channel": "beta"}})
+    assert config_patch_is_soft({"matcher": {"enabled": True, "folders": ["/data"]}})
+    assert config_patch_is_soft({"interceptor": {"stalled_min_minutes": 45, "delivery_mode": "webseed"}})
+    # Structural interceptor lifecycle → hard
+    assert not config_patch_is_soft({"interceptor": {"enabled": False}})
+    assert not config_patch_is_soft({"qbt": {"url": "http://127.0.0.1:9090"}})
+    assert not config_patch_is_soft({"providers": []})
+    assert not config_patch_is_soft({"anonymity": {"enabled": False}})
+    assert not config_patch_is_soft({"server": {"api_token": "x"}})
+    # Unknown top-level → hard (safe default)
+    assert not config_patch_is_soft({"weird": {"x": 1}})
+    assert not config_patch_is_soft({})
