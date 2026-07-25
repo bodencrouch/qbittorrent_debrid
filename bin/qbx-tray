@@ -26,7 +26,7 @@ qbx tray
 Usage:
   qbx-tray            Start the tray + native app shell (background)
   qbx-tray --panel    Show the native app window (starts tray if needed)
-  qbx-tray --stop     Stop the tray
+  qbx-tray --stop     Stop the tray and the managed daemon
   qbx-tray --check    Print tray readiness (exit 0 when ready)
   qbx-tray --status   Show qbx status (notify when available)
   qbx-tray --help     Show this help
@@ -111,19 +111,35 @@ record_tray_pid() {
 
 stop_tray() {
   local pid
-  if tray_process_running; then
-    pkill -f "${QT_TRAY}" 2>/dev/null || true
-    echo "Stopped qbx tray."
-  elif [[ -f "$TRAY_PID_FILE" ]]; then
+  # Prefer a graceful tray exit so aboutToQuit can stop the managed daemon.
+  # Fall back to SIGTERM, then always stop the launcher-managed daemon.
+  if [[ -f "$TRAY_PID_FILE" ]]; then
     pid="$(cat "$TRAY_PID_FILE" 2>/dev/null || true)"
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
+      # Give aboutToQuit a moment to run qbx --stop.
+      local _
+      for _ in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      kill -9 "$pid" 2>/dev/null || true
+      echo "Stopped qbx tray."
+    elif tray_process_running; then
+      pkill -f "${QT_TRAY}" 2>/dev/null || true
+      echo "Stopped qbx tray."
+    else
+      echo "qbx tray is not running."
     fi
+  elif tray_process_running; then
+    pkill -f "${QT_TRAY}" 2>/dev/null || true
     echo "Stopped qbx tray."
   else
     echo "qbx tray is not running."
   fi
   rm -f "$TRAY_PID_FILE"
+  # Ensure daemon is down even if the tray never got aboutToQuit (SIGKILL/pkill).
+  "$LAUNCHER" --stop >/dev/null 2>&1 || true
 }
 
 tray_registered() {

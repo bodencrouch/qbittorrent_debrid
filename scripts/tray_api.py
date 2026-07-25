@@ -47,6 +47,26 @@ def ensure_daemon(launcher: str | None = None) -> None:
     )
 
 
+def stop_daemon(launcher: str | None = None) -> None:
+    """Stop the launcher-managed daemon (API, interceptor, Control Shell).
+
+    Uses ``qbx --stop``, which only kills the PID tracked under
+    ``$XDG_RUNTIME_DIR/qbx/server.pid`` — unmanaged ``qbx serve`` processes
+    are left alone.
+    """
+    launcher = launcher or launcher_path()
+    try:
+        subprocess.run(
+            [launcher, "--stop"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 class QbxClient:
     """Minimal HTTP client for the local qbx daemon."""
 

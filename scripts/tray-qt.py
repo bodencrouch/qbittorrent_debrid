@@ -12,7 +12,14 @@ _scripts_dir = os.path.dirname(os.path.abspath(__file__))
 if _scripts_dir not in sys.path:
     sys.path.insert(0, _scripts_dir)
 
-from tray_api import QbxClient, app_dir, ensure_daemon, health_label, launcher_path  # noqa: E402
+from tray_api import (  # noqa: E402
+    QbxClient,
+    app_dir,
+    ensure_daemon,
+    health_label,
+    launcher_path,
+    stop_daemon,
+)
 
 
 WINDOW_WIDTH = 1280
@@ -206,6 +213,10 @@ def run_tray_app(show_window_on_start: bool = False) -> int:
         except Exception:
             tray.setToolTip("qbx — offline")
 
+    # Quit stops the managed daemon (API, interceptor, Control Shell) as well
+    # as the tray process — otherwise background services keep running.
+    app.aboutToQuit.connect(lambda: stop_daemon(launcher))
+
     menu = QMenu()
     menu.addAction("Show Control Shell", show_window)
     menu.addAction("Open qBittorrent WebUI", show_qbt)
@@ -213,7 +224,7 @@ def run_tray_app(show_window_on_start: bool = False) -> int:
     menu.addAction("Reload window", lambda: show_window(force_reload=True))
     menu.addAction("Show status notification", lambda: notify_status(root, client))
     menu.addSeparator()
-    menu.addAction("Quit tray", app.quit)
+    menu.addAction("Quit", app.quit)
     tray.setContextMenu(menu)
 
     def on_tray_activated(reason: QSystemTrayIcon.ActivationReason) -> None:
