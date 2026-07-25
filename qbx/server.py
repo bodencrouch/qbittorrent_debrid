@@ -1066,6 +1066,52 @@ def _register_routes(app: FastAPI) -> None:
         except QbtError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    @app.post("/api/qbt/rename-file", dependencies=[guard])
+    async def qbt_rename_file(request: Request, body: dict):
+        """Rename a file in a torrent via qBittorrent WebAPI."""
+        state: AppState = request.app.state.qbx
+        try:
+            hash_val = body.get("hash", "")
+            old_path = body.get("old_path", "")
+            new_path = body.get("new_path", "")
+            if not hash_val or not old_path or not new_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="hash, old_path, and new_path are required",
+                )
+            await state.qbt.rename_file(hash_val, old_path, new_path)
+            state.events.emit(
+                "torrent.renamed",
+                f"Renamed file in {hash_val[:8]}...",
+                hash=hash_val,
+            )
+            return {"ok": True, "hash": hash_val, "old_path": old_path, "new_path": new_path}
+        except QbtError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.post("/api/qbt/rename-folder", dependencies=[guard])
+    async def qbt_rename_folder(request: Request, body: dict):
+        """Rename a folder in a torrent via qBittorrent WebAPI."""
+        state: AppState = request.app.state.qbx
+        try:
+            hash_val = body.get("hash", "")
+            old_path = body.get("old_path", "")
+            new_path = body.get("new_path", "")
+            if not hash_val or not old_path or not new_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="hash, old_path, and new_path are required",
+                )
+            await state.qbt.rename_folder(hash_val, old_path, new_path)
+            state.events.emit(
+                "torrent.renamed",
+                f"Renamed folder in {hash_val[:8]}...",
+                hash=hash_val,
+            )
+            return {"ok": True, "hash": hash_val, "old_path": old_path, "new_path": new_path}
+        except QbtError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     @app.post("/api/storage/scan", dependencies=[guard])
     async def storage_scan(request: Request):
         state: AppState = request.app.state.qbx
