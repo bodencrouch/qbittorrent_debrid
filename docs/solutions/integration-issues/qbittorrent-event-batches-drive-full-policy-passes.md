@@ -16,27 +16,21 @@ tags:
   - "event-batches"
 ---
 
-# Problem
-qBittorrent sync activity, duplicate handling, and debrid decisions were not presented as one policy cycle. That made the UI feel flat and made it harder to reason about stalled torrents, queue priority, and duplicate resolution together.
+# One policy cycle per qBittorrent event batch
 
-## Symptoms
-- Manual scans did not force duplicate management.
-- Event handling produced disconnected feedback instead of a single batch trail.
-- Startup or loose reactions were mixed in with real policy passes.
-- The debrid layer could not show clear lineage from a qBittorrent event to the resulting action.
+## Problem
 
-## Solution
-- Thread a stable `event_batch_id` through sync processing, policy passes, duplicate management, and downstream debrid actions.
-- Assign a batch id automatically when event updates arrive without one.
-- Make manual scans run duplicate checks explicitly with `force_duplicates=True`.
-- Emit grouped UI feedback for policy passes and duplicate groups, while keeping unbatched noise in a separate loose-reactions lane.
+Sync updates, duplicate handling, and debrid decisions used to feel like separate sparks. The UI looked flat, and it was hard to follow “this stalled torrent → this action.”
 
-## Validation
-- `pytest -q` passed: `108 passed`.
-- `node --check qbx/web/app.js` passed.
-- Browser proof confirmed the timeline now renders grouped output, including `Batch #1` and a separate `Loose reactions` section.
+## What we changed
 
-## Prevention
-- Keep event-batch propagation wired through any new qBittorrent event handler.
-- Add tests whenever a new policy path is introduced so duplicate management cannot bypass the batch trail.
-- Preserve conservative queue-frontier logic so only truly stalled torrents are debridbed.
+- Carry a stable `event_batch_id` through sync, policy passes, duplicates, and debrid work  
+- Create a batch id when events arrive without one  
+- Manual scans force duplicate checks  
+- Group UI feedback for real policy passes; keep unrelated noise in a “loose reactions” lane  
+
+## How to keep it healthy
+
+- Wire new event handlers through the same batch id  
+- Add tests when you add a new policy path  
+- Keep queue-frontier rules conservative so active torrents are not jumped  

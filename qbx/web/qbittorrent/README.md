@@ -1,5 +1,7 @@
 # qBittorrent WebUI
 
+> Vendored upstream WebUI assets served by qbx at `/qbt/`. The notes below are from qBittorrent; edit upstream, not this copy, when refreshing the vendor tree.
+
 ## Browser compatibility
 
 The upper bound will always be the latest stable release.

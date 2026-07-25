@@ -39,7 +39,8 @@ dev = [
 qbx = "qbx.cli:main"
 
 [project.urls]
-Homepage = "https://example.invalid/qbx"
+Homepage = "https://oldrepublicwizard.github.io/qbittorrent_debrid/"
+Repository = "https://github.com/oldrepublicwizard/qbittorrent_debrid"
 
 [tool.hatch.build.targets.wheel]
 packages = ["qbx"]
