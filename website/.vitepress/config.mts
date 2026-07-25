@@ -24,7 +24,7 @@ export default defineConfig({
         items: [
           { text: "Troubleshooting", link: "/troubleshooting/" },
           { text: "Contributing", link: "/contributing/" },
-          { text: "GitHub", link: "https://github.com/oldrepublicwizard/qbittorrent_debrid" },
+          { text: "GitHub", link: "https://github.com/bodencrouch/qbittorrent_debrid" },
         ],
       },
     ],
@@ -69,7 +69,7 @@ export default defineConfig({
       "/contributing/": [{ text: "Contributing", link: "/contributing/" }],
     },
     socialLinks: [
-      { icon: "github", link: "https://github.com/oldrepublicwizard/qbittorrent_debrid" },
+      { icon: "github", link: "https://github.com/bodencrouch/qbittorrent_debrid" },
     ],
     footer: {
       message: "Local-first debrid helper for qBittorrent.",

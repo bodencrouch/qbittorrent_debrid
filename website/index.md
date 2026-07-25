@@ -17,7 +17,7 @@ hero:
       link: /install/desktop
     - theme: alt
       text: GitHub
-      link: https://github.com/oldrepublicwizard/qbittorrent_debrid
+      link: https://github.com/bodencrouch/qbittorrent_debrid
 
 features:
   - title: Stays with qBittorrent
@@ -41,7 +41,7 @@ qBittorrent **5.0+** with WebUI enabled, Python 3.10+, and a Real-Debrid and/or 
 ## Quick start
 
 ```bash
-git clone https://github.com/oldrepublicwizard/qbittorrent_debrid.git
+git clone https://github.com/bodencrouch/qbittorrent_debrid.git
 cd qbittorrent_debrid
 ./scripts/install-local.sh
 qbx setup
