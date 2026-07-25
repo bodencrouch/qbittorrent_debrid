@@ -2,11 +2,11 @@
 
 qbx only **checks** GitHub Releases. It does not replace your install.
 
-1. Set `updates.source_owner` / `updates.source_repo` (or fill them in Settings).  
-2. Choose `stable` or `beta`.  
-3. Use **Check for updates** or let the shell check once at startup.  
+1. In Settings → Application, pick owner/repo (defaults to upstream; forks are listed) and channel.
+2. Choose a release version — install commands appear for that tag.
+3. Or use **Check for latest on channel** to compare against what you have installed.
 
-You get a release link and short reinstall commands. Typical source upgrade:
+`stable` excludes prereleases; `beta` includes alphas/betas/rcs. Typical source upgrade:
 
 ```bash
 git fetch --tags && git checkout vX.Y.Z

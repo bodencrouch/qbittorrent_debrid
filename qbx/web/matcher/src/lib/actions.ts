@@ -3,10 +3,10 @@
  * One definition per op — surfaces only choose which subset to render.
  */
 
-import { ControlApi, QBitService, type HealthInfo, type TorrentInfo } from "@/api/backend"
+import { ControlApi, QBitService, StorageService, type HealthInfo, type TorrentInfo } from "@/api/backend"
 import { uiLog } from "@/lib/ui-log"
 
-export type ActionGroup = "Daemon" | "Torrent" | "Nav" | "Settings"
+export type ActionGroup = "Daemon" | "Torrent" | "Nav" | "Settings" | "Storage"
 
 export type ActionContext = {
   torrent: TorrentInfo | null
@@ -14,6 +14,8 @@ export type ActionContext = {
   /** Open Settings to a section id (connection, providers, …). */
   openSettings?: (section?: string) => void
   onNavigate?: (tab: "overview" | "match" | "debrid", torrent: TorrentInfo) => void
+  /** Switch the shell to the Storage surface (duplicate & hardlink manager). */
+  openStorage?: () => void
   onActionDone?: () => void
   refreshHealth?: () => void | Promise<void>
 }
@@ -256,6 +258,25 @@ export const APP_ACTIONS: AppAction[] = [
     async run(ctx) {
       await ControlApi.interceptorScan()
       ctx.onActionDone?.()
+    },
+  },
+  {
+    id: "storage-open",
+    label: "Go to Storage",
+    group: "Storage",
+    tip: "Open the exact-content duplicate & hardlink manager.",
+    run(ctx) {
+      ctx.openStorage?.()
+    },
+  },
+  {
+    id: "storage-scan",
+    label: "Scan storage for duplicates",
+    group: "Storage",
+    tip: "Hash size collisions under the configured roots. Log: storage.scan.*",
+    async run(ctx) {
+      ctx.openStorage?.()
+      await StorageService.scan()
     },
   },
   {

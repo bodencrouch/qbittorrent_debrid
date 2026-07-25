@@ -7,7 +7,14 @@ import pytest
 
 from qbx import __version__
 from qbx.config import UpdatesConfig
-from qbx.update import check_for_update, clear_cache, compare_versions, parse_version
+from qbx.update import (
+    check_for_update,
+    clear_cache,
+    compare_versions,
+    list_releases,
+    list_update_sources,
+    parse_version,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -185,3 +192,61 @@ async def test_release_cache_avoids_second_fetch():
         await check_for_update(cfg, current="0.1.0", client=client)
         await check_for_update(cfg, current="0.1.0", client=client)
     assert calls["n"] == 1
+
+
+async def test_list_releases_filters_by_channel():
+    async def handler(request):
+        return _releases_response([
+            {"tag_name": "v0.3.0-rc1", "prerelease": True, "name": "rc", "html_url": "u1"},
+            {"tag_name": "v0.2.0", "prerelease": False, "name": "stable", "html_url": "u2"},
+            {"tag_name": "v0.1.0", "prerelease": False, "draft": True},
+        ])
+
+    async with _client(handler) as client:
+        stable = await list_releases("acme", "qbx", "stable", client=client)
+        clear_cache()
+        beta = await list_releases("acme", "qbx", "beta", client=client)
+
+    assert stable["ok"] is True
+    assert [r["tag"] for r in stable["releases"]] == ["v0.2.0"]
+    assert beta["ok"] is True
+    assert [r["tag"] for r in beta["releases"]] == ["v0.3.0-rc1", "v0.2.0"]
+    assert beta["releases"][0]["guided_commands"]
+
+
+async def test_list_update_sources_aggregates_forks():
+    async def handler(request):
+        path = str(request.url)
+        if path.endswith("/forks") or "/forks?" in path:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "name": "qbittorrent_debrid",
+                        "html_url": "https://github.com/alice/qbittorrent_debrid",
+                        "owner": {"login": "alice"},
+                    },
+                    {
+                        "name": "qbittorrent_debrid-fork",
+                        "html_url": "https://github.com/bob/qbittorrent_debrid-fork",
+                        "owner": {"login": "bob"},
+                    },
+                ],
+            )
+        return httpx.Response(404)
+
+    async with _client(handler) as client:
+        res = await list_update_sources("bodencrouch", "qbittorrent_debrid", client=client)
+
+    assert res["ok"] is True
+    names = [s["full_name"] for s in res["sources"]]
+    assert names[0] == "bodencrouch/qbittorrent_debrid"
+    assert "alice/qbittorrent_debrid" in names
+    assert "bob/qbittorrent_debrid-fork" in names
+    assert res["sources"][0]["upstream"] is True
+
+
+async def test_list_update_sources_rejects_invalid_upstream():
+    res = await list_update_sources("../etc", "qbx")
+    assert res["ok"] is False
+    assert "invalid" in res["error"]

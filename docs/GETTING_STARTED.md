@@ -38,6 +38,7 @@ Enter your qBittorrent WebUI URL (often `http://127.0.0.1:8080` or `:8084`), use
 
 ```bash
 qbx check
+qbx check --json   # credentials + contract report
 qbx                 # desktop launcher
 # or
 qbx serve           # API + UI daemon only
@@ -52,6 +53,8 @@ Open **http://127.0.0.1:8484**.
 | `/?view=match` | Jump to the match workspace |
 
 In the Control Shell: select a torrent and use the **action bar** under the header (Force debrid, Nudge, Retry, …), or press **⌘K / Ctrl+K** for the command palette. **Settings** is a dialog with a section rail — Connection / Providers / Anonymity need Save; Interceptor / Matcher / Application apply as you change them.
+
+`qbx check` (and **Settings → Application → Integration health**) validates configured paths before matcher/storage automation runs. Hard failures (missing root, broken symlink, not writable) block apply actions until fixed. Soft warnings (e.g. qBittorrent default save path outside roots) are shown but do not block.
 
 ## 5. See it work
 

@@ -13,13 +13,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import json
 import logging
 import sys
+import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import httpx
 
 from .config import ConfigStore, cli_overrides_from_args
+from .contract import run_checks_async
 from .debrid import DebridManager
 from .engine.matcher import match_torrent
 from .qbt import QbtClient, QbtError
@@ -68,7 +72,13 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     sub.add_parser("setup", help="interactive configuration wizard")
-    sub.add_parser("check", help="validate qBittorrent and debrid credentials")
+    p_check = sub.add_parser("check", help="validate qBittorrent, debrid, and path contract")
+    p_check.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    p_check.add_argument(
+        "--bundle",
+        action="store_true",
+        help="write diagnostics zip (redacted config, contract, log tail) and print path",
+    )
 
     p_nudge = sub.add_parser("nudge", help="enqueue a policy pass on the running daemon")
     p_nudge.add_argument("--hash", default="", help="optional torrent hash")
@@ -105,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "setup":
         return _setup(store)
     if args.command == "check":
-        return asyncio.run(_check(store))
+        return asyncio.run(_check(store, json_output=args.json, bundle=args.bundle))
     if args.command == "nudge":
         return asyncio.run(_nudge(store, args))
     if args.command == "match":
@@ -193,44 +203,103 @@ def _setup(store: ConfigStore) -> int:
             "enabled": True,
         },
     })
-    print("\nSaved. Verifying credentials...\n")
-    return asyncio.run(_check(store))
+    print("\nSaved. Verifying credentials and path contract...\n")
+    print(
+        "Tip: point matcher folders at your library (protected) and download/incomplete areas separately.\n"
+        "In Docker, paths must match what qBittorrent and *arr apps see inside the container.\n"
+    )
+    return asyncio.run(_check(store, json_output=False))
 
 
-async def _check(store: ConfigStore) -> int:
+async def _check(store: ConfigStore, *, json_output: bool = False, bundle: bool = False) -> int:
     ok = True
+    cred: dict = {"qbt": {}, "debrid": {}}
     qbt = QbtClient(store.config.qbt)
+    qbt_ok = False
     try:
         await qbt.login()
+        qbt_ok = True
         version = await qbt.version()
         if not version.startswith("v"):
             version = f"v{version}"
         webapi = await qbt.webapi_version()
         webseeds = await qbt.supports_webseeds()
-        print(f"qBittorrent: OK ({version}, WebAPI {webapi})")
+        cred["qbt"] = {"ok": True, "version": version, "webapi": webapi, "webseeds": webseeds}
+        if not json_output:
+            print(f"qBittorrent: OK ({version}, WebAPI {webapi})")
         if store.config.interceptor.delivery_mode == "webseed" and not webseeds:
-            print("qBittorrent: WARNING - webseed WebAPI needs qBittorrent 5.0+")
+            if not json_output:
+                print("qBittorrent: WARNING - webseed WebAPI needs qBittorrent 5.0+")
+            cred["qbt"]["ok"] = False
             ok = False
-        elif webseeds:
+        elif not json_output:
             print("qBittorrent webseeds: OK")
     except QbtError as exc:
-        print(f"qBittorrent: FAILED - {exc}")
+        cred["qbt"] = {"ok": False, "error": str(exc)}
+        if not json_output:
+            print(f"qBittorrent: FAILED - {exc}")
         ok = False
-    finally:
-        await qbt.aclose()
 
     debrid = DebridManager(store.config)
     if not debrid.enabled:
-        print("Debrid: no providers configured")
+        cred["debrid"] = {"ok": False, "error": "no providers configured"}
+        if not json_output:
+            print("Debrid: no providers configured")
         ok = False
     else:
+        cred["debrid"] = {"ok": True, "providers": {}}
         for name, res in (await debrid.check_all()).items():
+            cred["debrid"]["providers"][name] = res
             if res.get("ok"):
-                print(f"Debrid[{name}]: OK")
+                if not json_output:
+                    print(f"Debrid[{name}]: OK")
             else:
-                print(f"Debrid[{name}]: FAILED - {res.get('error')}")
+                cred["debrid"]["ok"] = False
+                if not json_output:
+                    print(f"Debrid[{name}]: FAILED - {res.get('error')}")
                 ok = False
+
+    contract = await run_checks_async(store, qbt if qbt_ok else None)
+    if not json_output:
+        print(f"\nIntegration contract: {contract.status.upper()}")
+        for check in contract.checks:
+            prefix = "FAIL" if check.severity == "hard" else "WARN"
+            print(f"  [{prefix}] {check.title}: {check.detail}")
+    if contract.hard_fails:
+        ok = False
+
+    await qbt.aclose()
+
+    if json_output:
+        print(json.dumps({"credentials": cred, "contract": contract.as_dict()}, indent=2))
+
+    if bundle:
+        path = _write_check_bundle(store, cred, contract)
+        if not json_output:
+            print(f"\nDiagnostics bundle: {path}")
+
     return 0 if ok else 2
+
+
+def _write_check_bundle(store: ConfigStore, cred: dict, contract) -> Path:
+    from .log_buffer import get_log_buffer
+
+    out_dir = store.dir / "diagnostics"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    zip_path = out_dir / f"qbx-check-{stamp}.zip"
+    config_redacted = store.redacted()
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("credentials.json", json.dumps(cred, indent=2))
+        zf.writestr("contract.json", json.dumps(contract.as_dict(), indent=2))
+        zf.writestr("config-redacted.json", json.dumps(config_redacted, indent=2))
+        log_lines = get_log_buffer().history_since()
+        text = "\n".join(
+            f"{e.get('level', 'INFO')} {e.get('source', 'qbx')}: {e.get('message', '')}"
+            for e in log_lines[-200:]
+        )
+        zf.writestr("logs.txt", text or "(no log lines)")
+    return zip_path
 
 
 async def _nudge(store: ConfigStore, args: argparse.Namespace) -> int:

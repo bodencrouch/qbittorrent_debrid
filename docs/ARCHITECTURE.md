@@ -24,6 +24,7 @@ FastAPI daemon (qbx serve)  ←→  qBittorrent WebAPI
 | **Interceptor** | Decide which torrents get debrid help; inject webseeds |
 | **Debrid manager** | Real-Debrid / AllDebrid with priority order |
 | **Matcher** | Manual size rematch; optional content-hash placement |
+| **Storage service** | Single-flight content-duplicate scans; hardlink / quarantine reclaim |
 | **Config store** | Encrypted secrets in `~/.config/qbx/config.toml` |
 
 ## Delivery modes
@@ -42,10 +43,13 @@ If qBittorrent is stuck without a file tree (`metaDL` / missing metadata), qbx c
 - Respect queue frontier so active torrents are not jumped
 - Skip private torrents when configured
 - Update checks never apply packages automatically
+- Duplicate reclaim keeps at least one copy per group, refuses protected roots, and quarantines deletions instead of unlinking them
 
 ## Related code
 
 - `qbx/server.py` — HTTP surface
 - `qbx/engine/interceptor.py` — policy loop
 - `qbx/engine/metadata.py` — torrent cache fetch + SSRF checks
+- `qbx/engine/content_dedupe.py` — content grouping, keeper rules, safe reclaim, quarantine
+- `qbx/storage.py` — cancellable scan job + reclaim orchestration
 - `qbx/web/matcher/` — Control Shell source

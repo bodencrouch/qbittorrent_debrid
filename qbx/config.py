@@ -60,7 +60,9 @@ _SOFT_TOP_LEVEL = frozenset({
     "updates",
     "matcher",
     "duplicates",
+    "content_dupes",
     "quality",
+    "arr",
 })
 
 # Interceptor knobs read live from ConfigStore each scan. ``enabled`` is
@@ -239,6 +241,26 @@ class MatcherConfig(BaseModel):
     allow_cross_device_copy: bool = False  # reserved; EXDEV always skips today
 
 
+class ContentDupesConfig(BaseModel):
+    """Exact-content duplicate / hardlink manager (the Storage surface).
+
+    Unrelated to :class:`DuplicatesConfig`, which clusters *torrents* by title
+    similarity. Here grouping is byte-identical content (blake2b), and the unit
+    of work is a group of paths sharing one digest.
+
+    ``protected_roots`` are never offered as removal candidates — mark the
+    library sacred and leave incomplete / download dirs expendable. Deletions
+    move into a same-volume quarantine, so space is reclaimed only on purge.
+    """
+
+    roots: list[str] = Field(default_factory=list)
+    protected_roots: list[str] = Field(default_factory=list)
+    min_size_bytes: int = 1024 * 1024  # skip trivia; most dupe value is in media
+    default_keeper_rule: Literal["newest", "oldest", "shortest_path", "under_root"] = "newest"
+    # "" = quarantine beside the owning root (always same-volume, cheap rename).
+    quarantine_dir: str = ""
+
+
 class WatchFolderRule(BaseModel):
     path: str
     category: str = ""
@@ -302,6 +324,17 @@ class DesktopConfig(BaseModel):
     tray_autostart: bool = False
 
 
+class ArrServiceConfig(BaseModel):
+    enabled: bool = False
+    url: str = ""
+    api_key: str = ""
+
+
+class ArrConfig(BaseModel):
+    sonarr: ArrServiceConfig = Field(default_factory=ArrServiceConfig)
+    radarr: ArrServiceConfig = Field(default_factory=ArrServiceConfig)
+
+
 class AppConfig(BaseModel):
     configured: bool = False  # flipped by onboarding wizard / `qbx setup`
     server: ServerConfig = Field(default_factory=ServerConfig)
@@ -310,11 +343,13 @@ class AppConfig(BaseModel):
     anonymity: AnonymityConfig = Field(default_factory=AnonymityConfig)
     interceptor: InterceptorConfig = Field(default_factory=InterceptorConfig)
     duplicates: DuplicatesConfig = Field(default_factory=DuplicatesConfig)
+    content_dupes: ContentDupesConfig = Field(default_factory=ContentDupesConfig)
     matcher: MatcherConfig = Field(default_factory=MatcherConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
     quality: QualityConfig = Field(default_factory=QualityConfig)
     updates: UpdatesConfig = Field(default_factory=UpdatesConfig)
     desktop: DesktopConfig = Field(default_factory=DesktopConfig)
+    arr: ArrConfig = Field(default_factory=ArrConfig)
 
 
 def config_dir() -> Path:

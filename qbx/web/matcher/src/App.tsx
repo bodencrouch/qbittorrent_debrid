@@ -7,6 +7,8 @@ import { TorrentGrid } from "@/components/TorrentGrid"
 import { WorkspaceTabs, type TabId } from "@/components/WorkspaceTabs"
 import { LogPanel } from "@/components/LogPanel"
 import { SettingsPanel, type SettingsSection } from "@/components/SettingsPanel"
+import { StoragePanel } from "@/components/StoragePanel"
+import { OverviewPanel } from "@/components/OverviewPanel"
 import { CommandBar } from "@/components/CommandBar"
 import { CommandPalette } from "@/components/CommandPalette"
 import { ControlApi, type HealthInfo, type TorrentInfo } from "@/api/backend"
@@ -24,6 +26,16 @@ function readQuery(): { view?: string; hash?: string } {
 }
 
 type HealthState = "loading" | "online" | "offline" | "partial"
+
+/** Shell-level surface. Storage is torrent-independent, so it cannot live in
+ * WorkspaceTabs (those require a selected torrent). */
+type Surface = "overview" | "torrents" | "storage"
+
+function initialSurface(view?: string): Surface {
+  if (view === "storage") return "storage"
+  if (view === "torrents" || view === "match" || view === "debrid") return "torrents"
+  return "overview"
+}
 
 function healthState(health: HealthInfo | null, everLoaded: boolean): HealthState {
   if (!everLoaded && !health) return "loading"
@@ -56,6 +68,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsSection, setSettingsSection] = useState<SettingsSection | undefined>()
   const [paletteOpen, setPaletteOpen] = useState(false)
+  const [surface, setSurface] = useState<Surface>(initialSurface(query.view))
   const [workspaceTab, setWorkspaceTab] = useState<TabId>(
     query.view === "match" ? "match" : query.view === "debrid" ? "debrid" : "overview",
   )
@@ -154,8 +167,10 @@ export default function App() {
       openSettings,
       onNavigate: (tab, torrent) => {
         onSelect(torrent)
+        setSurface("torrents")
         setWorkspaceTab(tab)
       },
+      openStorage: () => setSurface("storage"),
       onActionDone: () => {
         setRefreshKey((k) => k + 1)
         void refreshHealth()
@@ -182,6 +197,15 @@ export default function App() {
 
   const hState = healthState(health, healthEverLoaded)
   const hBadge = healthBadge(hState)
+  const contractStatus = health?.contract?.status
+  const contractBadge =
+    contractStatus && contractStatus !== "ok"
+      ? {
+          label: `contract ${contractStatus}`,
+          variant: contractStatus === "blocked" ? ("destructive" as const) : ("outline" as const),
+        }
+      : null
+  const attentionCritical = health?.attention?.critical_count ?? 0
 
   return (
     <div className="h-screen flex flex-col bg-background text-foreground dark">
@@ -190,12 +214,51 @@ export default function App() {
         <Badge variant={hBadge.variant} className="text-[10px]">
           {hBadge.label}
         </Badge>
+        {contractBadge && (
+          <Badge variant={contractBadge.variant} className="text-[10px]">
+            {contractBadge.label}
+          </Badge>
+        )}
+        {attentionCritical > 0 && (
+          <Badge variant="destructive" className="text-[10px]">
+            {attentionCritical} need attention
+          </Badge>
+        )}
         <Badge variant="outline" className="text-[10px]">
           debrid {health?.debrid_enabled ? "on" : "off"}
         </Badge>
         <Badge variant="outline" className="text-[10px]">
           interceptor {health?.interceptor_running ? "running" : "stopped"}
         </Badge>
+        <nav aria-label="Primary" className="flex items-center gap-1 ml-2">
+          <Button
+            size="sm"
+            variant={surface === "overview" ? "default" : "outline"}
+            className="h-7 text-xs"
+            aria-current={surface === "overview" ? "page" : undefined}
+            onClick={() => setSurface("overview")}
+          >
+            Overview
+          </Button>
+          <Button
+            size="sm"
+            variant={surface === "torrents" ? "default" : "outline"}
+            className="h-7 text-xs"
+            aria-current={surface === "torrents" ? "page" : undefined}
+            onClick={() => setSurface("torrents")}
+          >
+            Torrents
+          </Button>
+          <Button
+            size="sm"
+            variant={surface === "storage" ? "default" : "outline"}
+            className="h-7 text-xs"
+            aria-current={surface === "storage" ? "page" : undefined}
+            onClick={() => setSurface("storage")}
+          >
+            Storage
+          </Button>
+        </nav>
         <div className="ml-auto flex items-center gap-2">
           <Button size="sm" variant="outline" className="h-7 text-xs" onClick={toggleInterceptor}>
             {health?.interceptor_running ? "Stop interceptor" : "Start interceptor"}
@@ -240,6 +303,17 @@ export default function App() {
       <div className="flex-1 min-h-0">
         <Group orientation="vertical" className="h-full" {...verticalLayout}>
           <Panel id="main" defaultSize="72" minSize="35">
+            {surface === "overview" ? (
+              <OverviewPanel
+                health={health}
+                onOpenSettings={openSettings}
+                onOpenStorage={() => setSurface("storage")}
+                onOpenTorrents={() => setSurface("torrents")}
+                onRefreshHealth={() => void refreshHealth()}
+              />
+            ) : surface === "storage" ? (
+              <StoragePanel />
+            ) : (
             <Group orientation="horizontal" className="h-full" {...horizontalLayout}>
               <Panel id="grid" defaultSize="55" minSize="30">
                 <TorrentGrid
@@ -267,6 +341,7 @@ export default function App() {
                 />
               </Panel>
             </Group>
+            )}
           </Panel>
           <Separator className="h-1.5 bg-border/60 hover:bg-sky-500/50 transition-colors" />
           <Panel id="logs" defaultSize="28" minSize="15">

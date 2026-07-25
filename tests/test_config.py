@@ -201,6 +201,7 @@ def test_config_patch_is_soft_classification():
     assert config_patch_is_soft({"updates": {"check_on_startup": False, "channel": "beta"}})
     assert config_patch_is_soft({"matcher": {"enabled": True, "folders": ["/data"]}})
     assert config_patch_is_soft({"interceptor": {"stalled_min_minutes": 45, "delivery_mode": "webseed"}})
+    assert config_patch_is_soft({"content_dupes": {"roots": ["/media"], "min_size_bytes": 2048}})
     # Structural interceptor lifecycle → hard
     assert not config_patch_is_soft({"interceptor": {"enabled": False}})
     assert not config_patch_is_soft({"qbt": {"url": "http://127.0.0.1:9090"}})

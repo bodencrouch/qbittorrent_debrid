@@ -10,7 +10,8 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { ControlApi, type UpdateCheckResult } from "@/api/backend"
+import { ControlApi, IntegrationService, type UpdateCheckResult, type UpdateRelease, type UpdateSource } from "@/api/backend"
+import { IntegrationHealthPanel } from "@/components/IntegrationHealthPanel"
 import { cn, getErrorMessage } from "@/lib/utils"
 import { uiLog } from "@/lib/ui-log"
 import { toast } from "sonner"
@@ -74,6 +75,8 @@ type SettingsForm = {
   matcher_folders: string
   matcher_interval_minutes: number
   matcher_recheck: boolean
+  content_dupes_roots: string
+  content_dupes_protected_roots: string
   // Immediate: Application
   update_channel: "stable" | "beta"
   update_source_owner: string
@@ -124,6 +127,11 @@ function fromConfig(cfg: Record<string, unknown>): SettingsForm {
   const token = String(server.api_token || "")
   const proxy = String(anonymity.proxy_url || "")
   const folders = Array.isArray(matcher.folders) ? (matcher.folders as string[]) : []
+  const contentDupes = (cfg.content_dupes || {}) as Record<string, unknown>
+  const dupeRoots = Array.isArray(contentDupes.roots) ? (contentDupes.roots as string[]) : []
+  const protectedRoots = Array.isArray(contentDupes.protected_roots)
+    ? (contentDupes.protected_roots as string[])
+    : []
   return {
     qbt_url: String(qbt.url || ""),
     qbt_username: String(qbt.username || ""),
@@ -156,6 +164,8 @@ function fromConfig(cfg: Record<string, unknown>): SettingsForm {
     matcher_folders: folders.join(", "),
     matcher_interval_minutes: Number(matcher.interval_minutes ?? 60),
     matcher_recheck: matcher.recheck !== false,
+    content_dupes_roots: dupeRoots.join(", "),
+    content_dupes_protected_roots: protectedRoots.join(", "),
     update_channel: updates.channel === "beta" ? "beta" : "stable",
     update_source_owner: String(updates.source_owner || "bodencrouch"),
     update_source_repo: String(updates.source_repo || "qbittorrent_debrid"),
@@ -203,6 +213,13 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
   const [version, setVersion] = useState("")
   const [updateBusy, setUpdateBusy] = useState(false)
   const [updateResult, setUpdateResult] = useState<UpdateCheckResult | null>(null)
+  const [updateSources, setUpdateSources] = useState<UpdateSource[]>([])
+  const [sourcesBusy, setSourcesBusy] = useState(false)
+  const [sourcesError, setSourcesError] = useState("")
+  const [releaseOptions, setReleaseOptions] = useState<UpdateRelease[]>([])
+  const [releasesBusy, setReleasesBusy] = useState(false)
+  const [releasesError, setReleasesError] = useState("")
+  const [selectedTag, setSelectedTag] = useState("")
   const [rowStatus, setRowStatus] = useState<Record<string, ApplyStatus>>({})
   const softTimers = useRef<Record<string, number>>({})
 
@@ -219,6 +236,12 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
     setForm(null)
     setBaseline(null)
     setRowStatus({})
+    setUpdateSources([])
+    setReleaseOptions([])
+    setSelectedTag("")
+    setSourcesError("")
+    setReleasesError("")
+    setUpdateResult(null)
 
     const load = () => {
       attempt += 1
@@ -267,6 +290,99 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
     return [...form.providers].sort((a, b) => a.priority - b.priority)
   }, [form])
 
+  const ownerOptions = useMemo(() => {
+    const owners = new Set<string>()
+    for (const s of updateSources) owners.add(s.owner)
+    if (form?.update_source_owner) owners.add(form.update_source_owner)
+    owners.add("bodencrouch")
+    return Array.from(owners).sort((a, b) => {
+      if (a === "bodencrouch") return -1
+      if (b === "bodencrouch") return 1
+      return a.localeCompare(b)
+    })
+  }, [updateSources, form?.update_source_owner])
+
+  const repoOptions = useMemo(() => {
+    const owner = form?.update_source_owner || "bodencrouch"
+    const repos = new Set<string>()
+    for (const s of updateSources) {
+      if (s.owner.toLowerCase() === owner.toLowerCase()) repos.add(s.repo)
+    }
+    if (form?.update_source_repo) repos.add(form.update_source_repo)
+    repos.add("qbittorrent_debrid")
+    return Array.from(repos).sort((a, b) => {
+      if (a === "qbittorrent_debrid") return -1
+      if (b === "qbittorrent_debrid") return 1
+      return a.localeCompare(b)
+    })
+  }, [updateSources, form?.update_source_owner, form?.update_source_repo])
+
+  const selectedRelease = useMemo(
+    () => releaseOptions.find((r) => r.tag === selectedTag) || null,
+    [releaseOptions, selectedTag],
+  )
+
+  const loadReleases = useCallback(
+    async (owner: string, repo: string, channel: "stable" | "beta") => {
+      if (!owner || !repo) return
+      setReleasesBusy(true)
+      setReleasesError("")
+      try {
+        const res = await ControlApi.updateReleases({ owner, repo, channel })
+        setReleaseOptions(res.releases || [])
+        if (res.error) setReleasesError(res.error)
+        setSelectedTag((prev) => {
+          if (prev && res.releases.some((r) => r.tag === prev)) return prev
+          return res.releases[0]?.tag || ""
+        })
+      } catch (err) {
+        setReleaseOptions([])
+        setSelectedTag("")
+        setReleasesError(getErrorMessage(err))
+      } finally {
+        setReleasesBusy(false)
+      }
+    },
+    [],
+  )
+
+  useEffect(() => {
+    if (!open || section !== "application" || !form) return
+    let cancelled = false
+    setSourcesBusy(true)
+    setSourcesError("")
+    ControlApi.updateSources()
+      .then((res) => {
+        if (cancelled) return
+        setUpdateSources(res.sources || [])
+        if (!res.ok && res.error) setSourcesError(res.error)
+      })
+      .catch((err) => {
+        if (!cancelled) setSourcesError(getErrorMessage(err))
+      })
+      .finally(() => {
+        if (!cancelled) setSourcesBusy(false)
+      })
+    return () => {
+      cancelled = true
+    }
+    // Load once when Application opens with a form; forks list is upstream-based.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, section, Boolean(form)])
+
+  // Re-fetch releases whenever owner/repo/channel changes in Application.
+  useEffect(() => {
+    if (!open || section !== "application" || !form) return
+    void loadReleases(form.update_source_owner, form.update_source_repo, form.update_channel)
+  }, [
+    open,
+    section,
+    form?.update_source_owner,
+    form?.update_source_repo,
+    form?.update_channel,
+    loadReleases,
+  ])
+
   const requestClose = useCallback(() => {
     if (dirtySave) {
       const ok = window.confirm("Discard unsaved Connection / Providers / Anonymity changes?")
@@ -295,6 +411,19 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
             setStatus(key, "applied")
             setBaseline((prev) => (prev && form ? { ...prev, ...pickSoftBaseline(form, patch) } : prev))
             onSaved?.()
+            const touchesPaths =
+              "matcher" in patch && "folders" in ((patch.matcher as Record<string, unknown>) || {}) ||
+              "content_dupes" in patch
+            if (touchesPaths) {
+              try {
+                const report = await IntegrationService.run()
+                if (report.status === "blocked") {
+                  toast.error("Path check failed — automation is blocked until paths are fixed")
+                }
+              } catch {
+                // Health refresh on next poll is enough if re-check fails.
+              }
+            }
           } catch (err) {
             revert()
             setStatus(key, "error")
@@ -305,6 +434,24 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
       }, 400)
     },
     [form, onSaved],
+  )
+
+  const persistSource = useCallback(
+    (owner: string, repo: string) => {
+      if (!form) return
+      const prevO = form.update_source_owner
+      const prevR = form.update_source_repo
+      setForm({ ...form, update_source_owner: owner, update_source_repo: repo })
+      applySoft(
+        "up.source",
+        { updates: { source_owner: owner, source_repo: repo } },
+        () =>
+          setForm((f) =>
+            f ? { ...f, update_source_owner: prevO, update_source_repo: prevR } : f,
+          ),
+      )
+    },
+    [applySoft, form],
   )
 
   const discardSave = () => {
@@ -719,6 +866,10 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
                       )
                     }}
                   />
+                  <p className="text-[10px] text-muted-foreground -mt-1">
+                    Minutes a torrent must stay stalled before debrid eligibility. Recommended: 15–60.
+                    Lower values act sooner but increase API usage (~{Math.max(1, Math.round(1440 / Math.max(1, form.stalled_min_minutes)))} passes/day at 24h polling).
+                  </p>
                   <SoftNumber
                     label="Min stalled seeds"
                     value={form.min_stalled_seeds}
@@ -896,6 +1047,50 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
                       }}
                       placeholder="/data/media, /mnt/library"
                     />
+                    <p className="text-[10px] text-muted-foreground mt-1 leading-relaxed">
+                      Point matcher folders at your library (protected) and download/incomplete areas separately.
+                      In Docker, paths must match what qBittorrent and *arr apps see inside the container.
+                    </p>
+                  </Field>
+                  <Field label="Storage scan roots (comma-separated)" hint={<StatusHint id="cd.roots" />}>
+                    <Input
+                      className="h-8 text-xs font-mono"
+                      value={form.content_dupes_roots}
+                      onChange={(e) => setForm({ ...form, content_dupes_roots: e.target.value })}
+                      onBlur={() => {
+                        const roots = form.content_dupes_roots
+                          .split(",")
+                          .map((x) => x.trim())
+                          .filter(Boolean)
+                        const prev = baseline?.content_dupes_roots ?? form.content_dupes_roots
+                        applySoft(
+                          "cd.roots",
+                          { content_dupes: { roots } },
+                          () => setForm((f) => (f ? { ...f, content_dupes_roots: prev } : f)),
+                        )
+                      }}
+                      placeholder="/data/media"
+                    />
+                  </Field>
+                  <Field label="Protected roots (comma-separated)" hint={<StatusHint id="cd.protected" />}>
+                    <Input
+                      className="h-8 text-xs font-mono"
+                      value={form.content_dupes_protected_roots}
+                      onChange={(e) => setForm({ ...form, content_dupes_protected_roots: e.target.value })}
+                      onBlur={() => {
+                        const protected_roots = form.content_dupes_protected_roots
+                          .split(",")
+                          .map((x) => x.trim())
+                          .filter(Boolean)
+                        const prev = baseline?.content_dupes_protected_roots ?? form.content_dupes_protected_roots
+                        applySoft(
+                          "cd.protected",
+                          { content_dupes: { protected_roots } },
+                          () => setForm((f) => (f ? { ...f, content_dupes_protected_roots: prev } : f)),
+                        )
+                      }}
+                      placeholder="/data/library"
+                    />
                   </Field>
                   <SoftNumber
                     label="Interval minutes"
@@ -934,6 +1129,7 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
 
               {form && section === "application" && (
                 <SectionBlock title="Application" contract="Immediate">
+                  <IntegrationHealthPanel onOpenSettings={setSection} />
                   <div className="flex items-center gap-2 mb-1">
                     {version && (
                       <Badge variant="outline" className="text-[10px] font-mono">
@@ -956,63 +1152,119 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
                         )
                       }}
                     >
-                      <option value="stable">stable</option>
-                      <option value="beta">beta (prereleases)</option>
+                      <option value="stable">stable — exclude prereleases</option>
+                      <option value="beta">beta — include prereleases (alpha/beta/rc)</option>
                     </select>
                   </Field>
-                  <Field label="GitHub source (owner / repo)" hint={<StatusHint id="up.source" />}>
-                    <div className="flex gap-1">
-                      <Input
-                        className="h-8 text-xs font-mono"
+                  <Field
+                    label="GitHub source"
+                    hint={
+                      <>
+                        <StatusHint id="up.source" />
+                        {sourcesBusy && (
+                          <span className="text-[10px] ml-2 text-muted-foreground">Loading forks…</span>
+                        )}
+                      </>
+                    }
+                  >
+                    <div className="grid grid-cols-2 gap-1">
+                      <select
+                        className="h-8 w-full rounded-md border border-input bg-transparent px-2 text-xs font-mono"
                         value={form.update_source_owner}
-                        onChange={(e) => setForm({ ...form, update_source_owner: e.target.value })}
-                        onBlur={() => {
-                          const prevO = baseline?.update_source_owner ?? form.update_source_owner
-                          const prevR = baseline?.update_source_repo ?? form.update_source_repo
-                          applySoft(
-                            "up.source",
-                            {
-                              updates: {
-                                source_owner: form.update_source_owner.trim(),
-                                source_repo: form.update_source_repo.trim(),
-                              },
-                            },
-                            () =>
-                              setForm((f) =>
-                                f
-                                  ? { ...f, update_source_owner: prevO, update_source_repo: prevR }
-                                  : f,
-                              ),
-                          )
+                        disabled={sourcesBusy && ownerOptions.length <= 1}
+                        onChange={(e) => {
+                          const owner = e.target.value
+                          const reposForOwner = updateSources
+                            .filter((s) => s.owner.toLowerCase() === owner.toLowerCase())
+                            .map((s) => s.repo)
+                          const preferred =
+                            reposForOwner.find((r) => r === "qbittorrent_debrid") ||
+                            reposForOwner[0] ||
+                            "qbittorrent_debrid"
+                          persistSource(owner, preferred)
                         }}
-                        placeholder="bodencrouch"
-                      />
-                      <Input
-                        className="h-8 text-xs font-mono"
+                      >
+                        {ownerOptions.map((owner) => (
+                          <option key={owner} value={owner}>
+                            {owner}
+                            {owner === "bodencrouch" ? " (upstream)" : ""}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        className="h-8 w-full rounded-md border border-input bg-transparent px-2 text-xs font-mono"
                         value={form.update_source_repo}
-                        onChange={(e) => setForm({ ...form, update_source_repo: e.target.value })}
-                        onBlur={() => {
-                          const prevO = baseline?.update_source_owner ?? form.update_source_owner
-                          const prevR = baseline?.update_source_repo ?? form.update_source_repo
-                          applySoft(
-                            "up.source",
-                            {
-                              updates: {
-                                source_owner: form.update_source_owner.trim(),
-                                source_repo: form.update_source_repo.trim(),
-                              },
-                            },
-                            () =>
-                              setForm((f) =>
-                                f
-                                  ? { ...f, update_source_owner: prevO, update_source_repo: prevR }
-                                  : f,
-                              ),
-                          )
-                        }}
-                        placeholder="qbittorrent_debrid"
-                      />
+                        disabled={sourcesBusy && repoOptions.length <= 1}
+                        onChange={(e) => persistSource(form.update_source_owner, e.target.value)}
+                      >
+                        {repoOptions.map((repo) => (
+                          <option key={repo} value={repo}>
+                            {repo}
+                          </option>
+                        ))}
+                      </select>
                     </div>
+                    {sourcesError && (
+                      <p className="text-[10px] text-amber-400 mt-1">{sourcesError}</p>
+                    )}
+                    <p className="text-[10px] text-muted-foreground mt-1">
+                      Defaults to bodencrouch/qbittorrent_debrid. Owner list aggregates upstream + forks.
+                    </p>
+                  </Field>
+                  <Field
+                    label="Release version"
+                    hint={
+                      releasesBusy ? (
+                        <span className="text-[10px] ml-2 text-muted-foreground">Loading…</span>
+                      ) : null
+                    }
+                  >
+                    <select
+                      className="h-8 w-full rounded-md border border-input bg-transparent px-2 text-xs font-mono"
+                      value={selectedTag}
+                      disabled={releasesBusy || releaseOptions.length === 0}
+                      onChange={(e) => setSelectedTag(e.target.value)}
+                    >
+                      {releaseOptions.length === 0 && (
+                        <option value="">
+                          {releasesBusy ? "Loading releases…" : "No releases for this channel"}
+                        </option>
+                      )}
+                      {releaseOptions.map((r) => (
+                        <option key={r.tag} value={r.tag}>
+                          {r.tag}
+                          {r.prerelease ? " (prerelease)" : ""}
+                          {r.name && r.name !== r.tag ? ` — ${r.name}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                    {releasesError && (
+                      <p className="text-[10px] text-amber-400 mt-1">{releasesError}</p>
+                    )}
+                    {selectedRelease && (
+                      <div className="mt-2 space-y-1.5">
+                        <div className="flex flex-wrap items-center gap-2">
+                          {selectedRelease.html_url && (
+                            <a
+                              className="text-xs text-sky-400 underline"
+                              href={selectedRelease.html_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              Release notes
+                            </a>
+                          )}
+                          <span className="text-[10px] text-muted-foreground">
+                            Check-only — install with the commands below
+                          </span>
+                        </div>
+                        {selectedRelease.guided_commands.length > 0 && (
+                          <pre className="rounded-md border border-border bg-card/60 p-2 text-[10px] font-mono overflow-auto whitespace-pre-wrap">
+                            {selectedRelease.guided_commands.join("\n")}
+                          </pre>
+                        )}
+                      </div>
+                    )}
                   </Field>
                   <SoftCheck
                     label="Check for updates when the shell opens"
@@ -1062,7 +1314,7 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
                       onClick={() => void checkUpdates()}
                       disabled={updateBusy}
                     >
-                      {updateBusy ? "Checking…" : "Check for updates"}
+                      {updateBusy ? "Checking…" : "Check for latest on channel"}
                     </Button>
                     {updateResult?.ok && updateResult.update_available && updateResult.release?.html_url && (
                       <a
@@ -1071,12 +1323,13 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
                         target="_blank"
                         rel="noopener noreferrer"
                       >
-                        {updateResult.latest} release notes
+                        {updateResult.latest} is newer than installed
                       </a>
                     )}
                   </div>
                   <p className="text-[10px] text-muted-foreground max-w-md pt-1">
-                    Advanced: WebUI config.toml wins over env / provisional YAML. Checks are check-only.
+                    Advanced: WebUI config.toml wins over env / provisional YAML. Update checks never
+                    download or apply binaries automatically.
                   </p>
                 </SectionBlock>
               )}
@@ -1117,6 +1370,7 @@ function pickSoftBaseline(form: SettingsForm, patch: Record<string, unknown>): P
   const out: Partial<SettingsForm> = {}
   const ix = patch.interceptor as Record<string, unknown> | undefined
   const mt = patch.matcher as Record<string, unknown> | undefined
+  const cd = patch.content_dupes as Record<string, unknown> | undefined
   const up = patch.updates as Record<string, unknown> | undefined
   const desk = patch.desktop as Record<string, unknown> | undefined
   if (ix) {
@@ -1138,6 +1392,10 @@ function pickSoftBaseline(form: SettingsForm, patch: Record<string, unknown>): P
     if ("folders" in mt) out.matcher_folders = form.matcher_folders
     if ("interval_minutes" in mt) out.matcher_interval_minutes = form.matcher_interval_minutes
     if ("recheck" in mt) out.matcher_recheck = form.matcher_recheck
+  }
+  if (cd) {
+    if ("roots" in cd) out.content_dupes_roots = form.content_dupes_roots
+    if ("protected_roots" in cd) out.content_dupes_protected_roots = form.content_dupes_protected_roots
   }
   if (up) {
     if ("channel" in up) out.update_channel = form.update_channel

@@ -18,7 +18,7 @@ interface CommandPaletteProps {
   onOpenChange: (open: boolean) => void
 }
 
-const GROUP_ORDER: ActionGroup[] = ["Torrent", "Daemon", "Nav", "Settings"]
+const GROUP_ORDER: ActionGroup[] = ["Torrent", "Daemon", "Storage", "Nav", "Settings"]
 
 export function CommandPalette({ ctx, open, onOpenChange }: CommandPaletteProps) {
   const [busyId, setBusyId] = useState<string | null>(null)
@@ -43,7 +43,7 @@ export function CommandPalette({ ctx, open, onOpenChange }: CommandPaletteProps)
     // Promote torrent group when a selection exists.
     const order = ctx.torrent
       ? GROUP_ORDER
-      : (["Daemon", "Nav", "Settings", "Torrent"] as ActionGroup[])
+      : (["Daemon", "Storage", "Nav", "Settings", "Torrent"] as ActionGroup[])
     return order.map((g) => ({ group: g, actions: map.get(g) || [] })).filter((x) => x.actions.length)
   }, [ctx.torrent])
 

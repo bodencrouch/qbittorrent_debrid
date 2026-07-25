@@ -23,10 +23,13 @@ Secrets in `config.toml` are encrypted at rest.
 | `providers` | Real-Debrid / AllDebrid keys, enable, priority |
 | `interceptor` | Stall rules, delivery mode, metadata handoff |
 | `matcher` | Size rematch folders; optional auto placement |
+| `content_dupes` | Storage surface roots, protected roots, min size, keeper rule |
 | `anonymity` | Proxy for debrid / downloads |
 | `updates` | GitHub owner/repo, channel, check on startup |
 | `desktop` | Notifications, tray autostart preference |
 | `server` | Bind host/port, optional API token |
+
+Storage **suppress** lists (hidden duplicate groups) are operational state in the qbx state dir (`storage-suppressed.jsonl`), not `config.toml`. Quarantine and reclaim audit logs use the same state dir pattern.
 
 ## Useful environment variables
 
@@ -51,7 +54,23 @@ In Control Shell → **Settings**:
 
 - **Connection / Providers / Anonymity** — dirty · Discard · Save (rebinds qBittorrent / debrid)
 - **Interceptor / Matcher** — apply immediately (soft prefs do not tear down the daemon)
-- **Application** — update channel / GitHub source (check-only; see [UPDATES.md](UPDATES.md)), desktop notifications (immediate), tray at login (dedicated API; OS sync)
+- **Application** — update channel / GitHub source (check-only; see [UPDATES.md](UPDATES.md)), desktop notifications (immediate), tray at login (dedicated API; OS sync), **Integration health** (contract checks)
+
+## Integration contract (paths)
+
+`qbx check`, `GET /api/integration/contract`, and **Settings → Application → Integration health** validate:
+
+- `matcher.folders`, `content_dupes.roots`, `content_dupes.protected_roots` — each path must exist, resolve (symlinks), and be writable
+- Optional qBittorrent alignment when WebUI is reachable (default save path, interceptor category filter)
+
+Writability is tested by creating `<root>/.qbx-probe/.write-test` and removing it.
+
+| Severity | Examples | Effect |
+|----------|----------|--------|
+| **Hard** | Missing root, broken symlink, not writable | Status `blocked`; matcher apply/run and storage scan/apply return HTTP 409 |
+| **Soft** | Duplicate paths, protected/scan overlap, qBT save path outside roots | Status `degraded`; automation still allowed |
+
+Point matcher folders at your **library** (protected) and **download/incomplete** areas separately. In Docker, paths must match what qBittorrent and *arr apps see inside the container.
 
 ## Docker note
 
