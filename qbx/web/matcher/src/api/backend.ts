@@ -150,6 +150,15 @@ export type HealthInfo = {
   last_log_id: number;
   contract?: ContractSummary;
   attention?: AttentionSummary;
+  server_info?: {
+    host: string;
+    port: number;
+  };
+  links?: {
+    dashboard: string;
+    qbittorrent_webui: string;
+    matcher: string;
+  };
 };
 
 export type AttentionSummary = {
@@ -379,6 +388,43 @@ export const MatcherService = {
       method: "POST",
       body: JSON.stringify(args),
     });
+  },
+
+  async GetRules(): Promise<MatcherRule[]> {
+    const r = await api<{ rules: MatcherRule[] }>("/api/matcher/rules");
+    return r.rules;
+  },
+
+  async UpdateRules(rules: MatcherRule[]): Promise<{ ok: boolean; rules: MatcherRule[] }> {
+    return api("/api/matcher/rules", {
+      method: "POST",
+      body: JSON.stringify(rules),
+    });
+  },
+};
+
+export type MatcherRule = {
+  name: string;
+  enabled: boolean;
+  search_path: string;
+  target_category: string;
+  target_save_path: string;
+  patterns: string;
+  priority: number;
+  require_same_extension: boolean;
+  skip_unmatched: boolean;
+  recheck: boolean;
+};
+
+export const QbtServiceExt = {
+  async GetCategories(): Promise<string[]> {
+    const r = await api<{ categories: string[] }>("/api/qbt/categories");
+    return r.categories;
+  },
+
+  async GetSavePaths(): Promise<string[]> {
+    const r = await api<{ save_paths: string[] }>("/api/qbt/save-paths");
+    return r.save_paths;
   },
 };
 

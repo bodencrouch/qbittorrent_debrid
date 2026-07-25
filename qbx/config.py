@@ -25,6 +25,7 @@ __all__ = [
     "InterceptorConfig",
     "DuplicatesConfig",
     "MatcherConfig",
+    "MatcherRuleConfig",
     "ContentDupesConfig",
     "WatchFolderRule",
     "AutomationConfig",
@@ -242,15 +243,43 @@ class DuplicatesConfig(BaseModel):
     min_title_similarity: float = 0.92
 
 
+class MatcherRuleConfig(BaseModel):
+    """A single matcher rule for dynamic path-based matching.
+    
+    Allows matching files in specific paths with custom settings.
+    """
+    name: str = ""
+    enabled: bool = True
+    # Path to search for files (supports glob patterns)
+    search_path: str = ""
+    # Optional: qBittorrent category to match (empty = all categories)
+    target_category: str = ""
+    # Optional: Specific save path in qBittorrent to match against
+    target_save_path: str = ""
+    # File patterns to match (glob patterns, comma-separated)
+    patterns: str = "*"
+    # Priority (lower = higher priority)
+    priority: int = 0
+    # Match files with same extension only
+    require_same_extension: bool = True
+    # Skip unmatched files (don't set to priority 0)
+    skip_unmatched: bool = False
+    # Recheck torrent after matching
+    recheck: bool = True
+
+
 class MatcherConfig(BaseModel):
     """Local file remapper + automatic content-hash placement.
 
     Manual size rematch (``qbx match`` / MatchingPanel) still uses folders +
     renameFile. Automatic placement (when ``enabled`` and ``auto_placement``)
     moves orphans / hardlinks owned matches to the torrent's expected paths.
+    
+    Supports both legacy simple folder list and new rule-based configuration.
     """
 
     enabled: bool = False
+    # Legacy: simple list of folders to search (backward compatible)
     folders: list[str] = Field(default_factory=list)
     interval_minutes: int = 60
     min_name_similarity: float = 0.72  # retained for future fuzzy modes
@@ -266,6 +295,10 @@ class MatcherConfig(BaseModel):
     max_hash_bytes_per_pass: int = 8 * 1024 * 1024 * 1024
     max_rechecks_per_pass: int = 10
     allow_cross_device_copy: bool = False  # reserved; EXDEV always skips today
+    
+    # New: rule-based configuration for dynamic path matching
+    # When rules are defined, they take precedence over the simple folders list
+    rules: list[MatcherRuleConfig] = Field(default_factory=list)
 
 
 class ContentDupesConfig(BaseModel):
