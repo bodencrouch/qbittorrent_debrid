@@ -23,7 +23,7 @@ Needs a graphical session.
 
 ## Update check says source not configured
 
-Set GitHub owner/repo under Settings → Application, or in `updates.source_owner` / `updates.source_repo`.
+Set GitHub owner/repo under Settings → Application (comboboxes list upstream + forks), or in `updates.source_owner` / `updates.source_repo`.
 
 ## Debrid never runs
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,10 +21,17 @@ from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
-from .config import ConfigStore, config_patch_is_soft
+from .config import (
+    DEFAULT_UPDATE_SOURCE_OWNER,
+    DEFAULT_UPDATE_SOURCE_REPO,
+    ConfigStore,
+    config_patch_is_soft,
+)
+from .contract import ContractReport, run_checks_async
+from .attention import attention_summary, build_attention_items, build_attention_payload
 from .debrid import DebridManager
-from .desktop import DesktopNotifier, sync_tray_autostart
-from .update import check_for_update
+from .desktop import DesktopNotifier, send_desktop_notification, sync_tray_autostart
+from .update import check_for_update, list_releases, list_update_sources
 from .engine import Automation, Interceptor, match_torrent
 from .engine.matcher import (
     TorrentFileEntry,
@@ -35,9 +43,13 @@ from .engine.matcher import (
 from .events import EventBus
 from .log_buffer import LogBuffer, attach_log_buffer, get_log_buffer
 from .qbt import QbtClient, QbtError
+from .storage import StorageService
 from . import qbt_proxy
 
 log = logging.getLogger("qbx.server")
+
+CONTRACT_STALE_SEC = 60
+CONTRACT_NOTIFY_DEBOUNCE_SEC = 60
 
 WEB_DIR = Path(__file__).parent / "web"
 SHELL_DIST = WEB_DIR / "matcher" / "dist"
@@ -56,6 +68,95 @@ class AppState:
     boot_id: str
     # Default keeps direct AppState(...) constructions in tests working.
     notifier: DesktopNotifier = field(default_factory=lambda: DesktopNotifier(enabled=False))
+    storage: StorageService | None = None
+    contract_report: ContractReport | None = None
+    contract_checked_at: float = 0.0
+    contract_last_notify_at: float = 0.0
+    contract_last_notified_status: str | None = None
+
+    def storage_service(self) -> StorageService:
+        if self.storage is None:
+            self.storage = StorageService(self.store, self.events)
+        return self.storage
+
+
+async def _refresh_contract(state: AppState, *, force: bool = False) -> ContractReport:
+    now = time.time()
+    prev_status = state.contract_report.status if state.contract_report else None
+    if (
+        not force
+        and state.contract_report is not None
+        and (now - state.contract_checked_at) < CONTRACT_STALE_SEC
+    ):
+        return state.contract_report
+    report = await run_checks_async(state.store, state.qbt)
+    state.contract_report = report
+    state.contract_checked_at = now
+    _notify_contract_transition(state, prev_status, report)
+    return report
+
+
+def _notify_contract_transition(
+    state: AppState,
+    prev_status: str | None,
+    report: ContractReport,
+) -> None:
+    if prev_status == report.status:
+        return
+    now = time.time()
+    if now - state.contract_last_notify_at < CONTRACT_NOTIFY_DEBOUNCE_SEC:
+        return
+    if report.status in ("degraded", "blocked"):
+        msg = f"Integration contract {report.status}"
+        state.events.emit("contract.status_changed", msg, status=report.status, source="contract")
+        if state.store.config.desktop.notifications:
+            send_desktop_notification("qbx contract", msg)
+    elif prev_status in ("degraded", "blocked") and report.status == "ok":
+        msg = "Integration contract OK"
+        state.events.emit("contract.status_changed", msg, status=report.status, source="contract")
+        if state.store.config.desktop.notifications:
+            send_desktop_notification("qbx contract", msg)
+    state.contract_last_notify_at = now
+    state.contract_last_notified_status = report.status
+
+
+def _contract_summary(report: ContractReport) -> dict:
+    return {
+        "status": report.status,
+        "hard_fails": report.hard_fails,
+        "soft_warns": report.soft_warns,
+        "checked_at": report.checked_at,
+    }
+
+
+async def _require_contract_ok(state: AppState) -> None:
+    report = await _refresh_contract(state)
+    if report.status == "blocked":
+        primary = report.primary_hard
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": "contract_blocked",
+                "primary_check": primary.as_dict() if primary else None,
+            },
+        )
+
+
+async def _attention_for_state(state: AppState) -> dict:
+    contract = await _refresh_contract(state)
+    snoozed = _load_snoozed_check_ids(state.store)
+    return build_attention_payload(
+        contract=contract,
+        interceptor=state.interceptor.stats,
+        storage_status=state.storage_service().status(),
+        snoozed_check_ids=snoozed,
+    )
+
+
+def _load_snoozed_check_ids(store: ConfigStore) -> set[str]:
+    from .contract_snooze import active_snoozed_ids
+
+    return active_snoozed_ids(store)
 
 
 def _check_token(request: Request, supplied: str | None) -> None:
@@ -91,7 +192,20 @@ def create_app(store: ConfigStore | None = None) -> FastAPI:
         app.state.qbx = AppState(
             store, qbt, debrid, interceptor, automation, events, logs, boot_id, notifier
         )
+        app.state.qbx.storage = StorageService(store, events)
         qbt_proxy.ensure_proxy_client(app)
+        try:
+            await qbt.login()
+            report = await run_checks_async(store, qbt)
+        except QbtError:
+            report = await run_checks_async(store, None)
+        app.state.qbx.contract_report = report
+        app.state.qbx.contract_checked_at = time.time()
+        if report.status == "blocked":
+            log.warning(
+                "integration contract blocked (%d hard failure(s)); matcher/storage mutations disabled",
+                report.hard_fails,
+            )
         # Reconcile the XDG autostart entry with saved preference (best-effort).
         # Only enforce the enabled state: removal happens exclusively through
         # the explicit endpoint so an unconfigured daemon (or the test suite)
@@ -108,6 +222,9 @@ def create_app(store: ConfigStore | None = None) -> FastAPI:
         try:
             yield
         finally:
+            storage = getattr(app.state.qbx, "storage", None)
+            if storage is not None:
+                await storage.stop()
             await automation.stop()
             await interceptor.stop()
             events.flush()
@@ -200,6 +317,14 @@ def _register_routes(app: FastAPI) -> None:
         lists so a stuck policy pass cannot make Settings / health time out.
         """
         state: AppState = request.app.state.qbx
+        contract = _contract_summary(await _refresh_contract(state))
+        attn_items = build_attention_items(
+            contract=state.contract_report,
+            interceptor=state.interceptor.stats,
+            storage_status=state.storage_service().status(),
+            snoozed_check_ids=_load_snoozed_check_ids(state.store),
+        )
+        attention = attention_summary(attn_items)
         full = state.interceptor.stats
         interceptor_lite = {
             k: full.get(k)
@@ -237,6 +362,8 @@ def _register_routes(app: FastAPI) -> None:
             "last_event_id": state.events.last_event_id,
             "last_log_id": state.logs.last_id,
             "boot_id": state.boot_id,
+            "contract": contract,
+            "attention": attention,
             "links": {
                 "dashboard": "/",
                 "qbittorrent_webui": "/qbt/",
@@ -258,6 +385,45 @@ def _register_routes(app: FastAPI) -> None:
             "check_on_startup": cfg.check_on_startup,
         }
 
+    @app.get("/api/integration/contract", dependencies=[guard])
+    async def integration_contract_get(request: Request):
+        state: AppState = request.app.state.qbx
+        report = await _refresh_contract(state)
+        return report.as_dict()
+
+    @app.post("/api/integration/contract/run", dependencies=[guard])
+    async def integration_contract_run(request: Request):
+        state: AppState = request.app.state.qbx
+        report = await _refresh_contract(state, force=True)
+        return report.as_dict()
+
+    @app.post("/api/integration/contract/snooze", dependencies=[guard])
+    async def integration_contract_snooze(request: Request, body: dict):
+        from .contract_snooze import snooze_check
+
+        state: AppState = request.app.state.qbx
+        check_id = str((body or {}).get("check_id") or "").strip()
+        if not check_id:
+            raise HTTPException(status_code=400, detail="missing 'check_id'")
+        report = state.contract_report or await _refresh_contract(state)
+        match = next((c for c in report.checks if c.id == check_id), None)
+        if match is None:
+            raise HTTPException(status_code=404, detail="check not found")
+        if match.severity == "hard":
+            raise HTTPException(status_code=400, detail="hard checks cannot be snoozed")
+        until = (body or {}).get("until")
+        if until is None:
+            days = float((body or {}).get("days") or 7)
+            until = time.time() + days * 86400
+        else:
+            until = float(until)
+        return snooze_check(state.store, check_id, until)
+
+    @app.get("/api/attention", dependencies=[guard])
+    async def attention_list(request: Request):
+        state: AppState = request.app.state.qbx
+        return await _attention_for_state(state)
+
     @app.get("/api/update/check", dependencies=[guard])
     async def update_check(request: Request):
         state: AppState = request.app.state.qbx
@@ -269,6 +435,50 @@ def _register_routes(app: FastAPI) -> None:
                 source="update",
             )
         return result
+
+    @app.get("/api/update/sources", dependencies=[guard])
+    async def update_sources(request: Request):
+        """Upstream + all GitHub forks for the Settings owner/repo comboboxes."""
+        cfg = request.app.state.qbx.store.config.updates
+        owner, repo = cfg.effective_source()
+        # Always enumerate forks of the canonical upstream so the combobox
+        # aggregates the full fork network, not just forks of the selected source.
+        result = await list_update_sources(DEFAULT_UPDATE_SOURCE_OWNER, DEFAULT_UPDATE_SOURCE_REPO)
+        # Ensure the currently configured source appears even if GitHub omitted it.
+        configured = {"owner": owner, "repo": repo}
+        sources = list(result.get("sources") or [])
+        if owner and repo and not any(
+            s.get("owner", "").lower() == owner.lower() and s.get("repo", "").lower() == repo.lower()
+            for s in sources
+        ):
+            sources.append(
+                {
+                    "owner": owner,
+                    "repo": repo,
+                    "upstream": False,
+                    "html_url": f"https://github.com/{owner}/{repo}",
+                    "full_name": f"{owner}/{repo}",
+                }
+            )
+            result["sources"] = sources
+        result["configured"] = configured
+        return result
+
+    @app.get("/api/update/releases", dependencies=[guard])
+    async def update_releases(
+        request: Request,
+        owner: str | None = None,
+        repo: str | None = None,
+        channel: str | None = None,
+    ):
+        """Channel-filtered releases for the selected owner/repo."""
+        cfg = request.app.state.qbx.store.config.updates
+        eff_owner, eff_repo = cfg.effective_source()
+        return await list_releases(
+            (owner or eff_owner).strip(),
+            (repo or eff_repo).strip(),
+            channel or cfg.channel,
+        )
 
     @app.post("/api/config/tray-autostart", dependencies=[guard])
     async def config_tray_autostart(request: Request, body: dict):
@@ -610,6 +820,8 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.post("/api/qbt/rename-file", dependencies=[guard])
     async def qbt_rename_file(request: Request, body: dict):
+        state: AppState = request.app.state.qbx
+        await _require_contract_ok(state)
         h = (body or {}).get("hash", "").strip()
         old = (body or {}).get("oldPath", "")
         new = (body or {}).get("newPath", "")
@@ -623,6 +835,8 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.post("/api/qbt/file-priority", dependencies=[guard])
     async def qbt_file_priority(request: Request, body: dict):
+        state: AppState = request.app.state.qbx
+        await _require_contract_ok(state)
         h = (body or {}).get("hash", "").strip()
         ids = (body or {}).get("id", "")
         priority = int((body or {}).get("priority", 0))
@@ -636,6 +850,8 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.post("/api/qbt/recheck", dependencies=[guard])
     async def qbt_recheck(request: Request, body: dict):
+        state: AppState = request.app.state.qbx
+        await _require_contract_ok(state)
         h = (body or {}).get("hash", "").strip()
         if not h:
             raise HTTPException(status_code=400, detail="hash required")
@@ -740,6 +956,7 @@ def _register_routes(app: FastAPI) -> None:
     @app.post("/api/matcher/run", dependencies=[guard])
     async def matcher_run(request: Request, body: dict):
         state: AppState = request.app.state.qbx
+        await _require_contract_ok(state)
         torrent_hash = (body or {}).get("hash", "").strip()
         if not torrent_hash:
             raise HTTPException(status_code=400, detail="missing 'hash'")
@@ -770,6 +987,109 @@ def _register_routes(app: FastAPI) -> None:
             unmatched=result.get("unmatched"),
             dry_run=dry_run,
         )
+        return result
+
+    @app.post("/api/storage/scan", dependencies=[guard])
+    async def storage_scan(request: Request):
+        state: AppState = request.app.state.qbx
+        await _require_contract_ok(state)
+        result = state.storage_service().start_scan()
+        if not result.get("accepted"):
+            raise HTTPException(status_code=409, detail=result.get("reason") or "scan_rejected")
+        return result
+
+    @app.post("/api/storage/scan/cancel", dependencies=[guard])
+    async def storage_scan_cancel(request: Request):
+        state: AppState = request.app.state.qbx
+        return state.storage_service().cancel_scan()
+
+    @app.get("/api/storage/status", dependencies=[guard])
+    async def storage_status(request: Request):
+        state: AppState = request.app.state.qbx
+        return state.storage_service().status()
+
+    @app.get("/api/storage/groups", dependencies=[guard])
+    async def storage_groups(request: Request):
+        state: AppState = request.app.state.qbx
+        limit = int(request.query_params.get("limit") or 500)
+        return state.storage_service().groups_payload(limit=limit)
+
+    @app.post("/api/storage/apply", dependencies=[guard])
+    async def storage_apply(request: Request, body: dict):
+        state: AppState = request.app.state.qbx
+        await _require_contract_ok(state)
+        items = (body or {}).get("items") or []
+        if not isinstance(items, list) or not items:
+            raise HTTPException(status_code=400, detail="missing 'items'")
+        result = await asyncio.to_thread(state.storage_service().apply, items)
+        if not result.get("ok"):
+            raise HTTPException(status_code=409, detail=result.get("reason") or "apply_rejected")
+        return result
+
+    @app.get("/api/storage/quarantine", dependencies=[guard])
+    async def storage_quarantine(request: Request):
+        state: AppState = request.app.state.qbx
+        return state.storage_service().quarantine_list()
+
+    @app.post("/api/storage/quarantine/restore", dependencies=[guard])
+    async def storage_quarantine_restore(request: Request, body: dict):
+        state: AppState = request.app.state.qbx
+        ids = [str(i) for i in ((body or {}).get("ids") or []) if str(i).strip()]
+        if not ids:
+            raise HTTPException(status_code=400, detail="missing 'ids'")
+        return await asyncio.to_thread(state.storage_service().quarantine_restore, ids)
+
+    @app.post("/api/storage/quarantine/purge", dependencies=[guard])
+    async def storage_quarantine_purge(request: Request, body: dict):
+        state: AppState = request.app.state.qbx
+        ids = [str(i) for i in ((body or {}).get("ids") or []) if str(i).strip()]
+        if not ids:
+            raise HTTPException(status_code=400, detail="missing 'ids'")
+        return await asyncio.to_thread(state.storage_service().quarantine_purge, ids)
+
+    @app.get("/api/storage/audit", dependencies=[guard])
+    async def storage_audit(request: Request):
+        state: AppState = request.app.state.qbx
+        limit = int(request.query_params.get("limit") or 100)
+        return {"items": state.storage_service().audit.tail(limit)}
+
+    @app.get("/api/storage/suppressed", dependencies=[guard])
+    async def storage_suppressed(request: Request):
+        return request.app.state.qbx.storage_service().suppressed_list()
+
+    @app.post("/api/storage/suppress", dependencies=[guard])
+    async def storage_suppress(request: Request, body: dict):
+        state: AppState = request.app.state.qbx
+        digest = str((body or {}).get("digest") or "").strip()
+        if not digest:
+            raise HTTPException(status_code=400, detail="missing 'digest'")
+        permanent = bool((body or {}).get("permanent", True))
+        reason = str((body or {}).get("reason") or "")
+        result = await asyncio.to_thread(
+            state.storage_service().suppress_group, digest, permanent=permanent, reason=reason
+        )
+        if not result.get("ok"):
+            raise HTTPException(status_code=404, detail=result.get("reason") or "suppress_failed")
+        return result
+
+    @app.post("/api/storage/suppressed/restore", dependencies=[guard])
+    async def storage_suppressed_restore(request: Request, body: dict):
+        state: AppState = request.app.state.qbx
+        ids = [str(i) for i in ((body or {}).get("ids") or []) if str(i).strip()]
+        if not ids:
+            raise HTTPException(status_code=400, detail="missing 'ids'")
+        return await asyncio.to_thread(state.storage_service().suppress_restore, ids)
+
+    @app.post("/api/storage/reveal", dependencies=[guard])
+    async def storage_reveal(request: Request, body: dict):
+        state: AppState = request.app.state.qbx
+        path = str((body or {}).get("path") or "").strip()
+        if not path:
+            raise HTTPException(status_code=400, detail="missing 'path'")
+        result = await asyncio.to_thread(state.storage_service().reveal_path, path)
+        if not result.get("ok"):
+            code = 403 if result.get("reason") in {"outside_roots", "quarantine_path"} else 400
+            raise HTTPException(status_code=code, detail=result.get("reason") or "reveal_failed")
         return result
 
     @app.post("/api/automation/scan", dependencies=[guard])

@@ -90,6 +90,51 @@ export type HealthInfo = {
   boot_id: string;
   last_event_id: number;
   last_log_id: number;
+  contract?: ContractSummary;
+  attention?: AttentionSummary;
+};
+
+export type AttentionSummary = {
+  open_count: number;
+  critical_count: number;
+  warning_count?: number;
+  info_count?: number;
+};
+
+export type AttentionItem = {
+  id: string;
+  kind: "contract" | "interceptor" | "storage" | "torrent";
+  severity: "critical" | "warning" | "info";
+  title: string;
+  detail: string;
+  primary_action: Record<string, unknown>;
+  href: string;
+  ts: number;
+};
+
+export type AttentionPayload = {
+  items: AttentionItem[];
+  counts: { critical: number; warning: number; info: number };
+};
+
+export type ContractSummary = {
+  status: "ok" | "degraded" | "blocked";
+  hard_fails: number;
+  soft_warns: number;
+  checked_at: number;
+};
+
+export type ContractCheck = {
+  id: string;
+  severity: "hard" | "soft";
+  title: string;
+  detail: string;
+  remediation: string;
+  settings_section: string;
+};
+
+export type ContractReport = ContractSummary & {
+  checks: ContractCheck[];
 };
 
 export type LogEntry = {
@@ -135,6 +180,40 @@ export type UpdateCheckResult = {
     body?: string;
   } | null;
   guided_commands: string[];
+  error: string | null;
+};
+
+export type UpdateSource = {
+  owner: string;
+  repo: string;
+  upstream: boolean;
+  html_url: string;
+  full_name: string;
+};
+
+export type UpdateSourcesResult = {
+  ok: boolean;
+  upstream: { owner: string; repo: string };
+  configured?: { owner: string; repo: string };
+  sources: UpdateSource[];
+  error: string | null;
+};
+
+export type UpdateRelease = {
+  tag: string;
+  name: string;
+  prerelease: boolean;
+  published_at?: string;
+  html_url?: string;
+  guided_commands: string[];
+};
+
+export type UpdateReleasesResult = {
+  ok: boolean;
+  owner: string;
+  repo: string;
+  channel: string;
+  releases: UpdateRelease[];
   error: string | null;
 };
 
@@ -241,6 +320,195 @@ export const MatcherService = {
     return api("/api/matcher/run", {
       method: "POST",
       body: JSON.stringify(args),
+    });
+  },
+};
+
+/** Integration contract checks (paths, writability, qBT alignment). */
+export const IntegrationService = {
+  get(): Promise<ContractReport> {
+    return api("/api/integration/contract");
+  },
+
+  run(): Promise<ContractReport> {
+    return api("/api/integration/contract/run", { method: "POST" });
+  },
+
+  snooze(checkId: string, until: number): Promise<{ ok: boolean }> {
+    return api("/api/integration/contract/snooze", {
+      method: "POST",
+      body: JSON.stringify({ check_id: checkId, until }),
+    });
+  },
+};
+
+/** Needs-attention queue (Overview surface). */
+export const AttentionService = {
+  get(): Promise<AttentionPayload> {
+    return api("/api/attention");
+  },
+};
+
+/** Exact-content duplicate manager (Storage surface). */
+export type DuplicateMember = {
+  path: string;
+  size: number;
+  dev: number;
+  ino: number;
+  nlink: number;
+  mtime: number;
+  root: string;
+  protected: boolean;
+};
+
+export type DuplicateGroup = {
+  digest: string;
+  size: number;
+  members: DuplicateMember[];
+  distinct_inodes: number;
+  reclaimable_bytes: number;
+  has_existing_hardlinks: boolean;
+  suggested_keeper: string;
+  suggested_losers: string[];
+};
+
+export type StorageScanProgress = {
+  files_seen: number;
+  candidates: number;
+  hashed: number;
+  groups_found: number;
+  reclaimable_bytes: number;
+  elapsed: number;
+  cancelled: boolean;
+  stage: string;
+};
+
+export type StorageStatus = {
+  running: boolean;
+  roots: string[];
+  protected_roots: string[];
+  scanned_at: number;
+  progress: StorageScanProgress;
+  groups: number;
+  reclaimable_bytes: number;
+  suppressed?: number;
+};
+
+export type StorageGroups = StorageStatus & {
+  truncated: boolean;
+  items: DuplicateGroup[];
+};
+
+export type ReclaimAction = "keep" | "link" | "delete";
+
+export type ReclaimOutcome = {
+  path: string;
+  action: "keep" | "link" | "delete" | "skip";
+  reason: string;
+  bytes_freed: number;
+  bytes_pending_purge: number;
+  quarantine_id: string;
+};
+
+export type ReclaimResult = {
+  ok: boolean;
+  linked: number;
+  deleted: number;
+  skipped: number;
+  bytes_freed: number;
+  bytes_pending_purge: number;
+  outcomes: ReclaimOutcome[];
+};
+
+export type QuarantineEntry = {
+  id: string;
+  ts: number;
+  original: string;
+  quarantined: string;
+  size: number;
+  digest: string;
+  state: string;
+};
+
+export type SuppressedEntry = {
+  id: string;
+  digest: string;
+  ts: number;
+  reason?: string;
+  permanent: boolean;
+  state: string;
+};
+
+export const StorageService = {
+  status(): Promise<StorageStatus> {
+    return api("/api/storage/status");
+  },
+
+  groups(limit = 500): Promise<StorageGroups> {
+    return api(`/api/storage/groups?limit=${limit}`);
+  },
+
+  scan(): Promise<{ accepted: boolean; roots?: string[] }> {
+    return api("/api/storage/scan", { method: "POST" });
+  },
+
+  cancelScan(): Promise<{ cancelled: boolean; reason?: string }> {
+    return api("/api/storage/scan/cancel", { method: "POST" });
+  },
+
+  apply(
+    items: { digest: string; keeper_path: string; actions: { path: string; action: ReclaimAction }[] }[],
+  ): Promise<ReclaimResult> {
+    return api("/api/storage/apply", {
+      method: "POST",
+      body: JSON.stringify({ items }),
+    });
+  },
+
+  quarantine(): Promise<{ items: QuarantineEntry[]; bytes_pending_purge: number }> {
+    return api("/api/storage/quarantine");
+  },
+
+  restore(ids: string[]): Promise<{ ok: boolean; restored: number }> {
+    return api("/api/storage/quarantine/restore", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    });
+  },
+
+  purge(ids: string[]): Promise<{ ok: boolean; purged: number; bytes_freed: number }> {
+    return api("/api/storage/quarantine/purge", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    });
+  },
+
+  audit(limit = 100): Promise<{ items: Record<string, unknown>[] }> {
+    return api(`/api/storage/audit?limit=${limit}`);
+  },
+
+  listSuppressed(): Promise<{ items: SuppressedEntry[]; count: number }> {
+    return api("/api/storage/suppressed");
+  },
+
+  suppress(digest: string, permanent = true): Promise<{ ok: boolean; id?: string; session_only?: boolean }> {
+    return api("/api/storage/suppress", {
+      method: "POST",
+      body: JSON.stringify({ digest, permanent }),
+    });
+  },
+
+  restoreSuppressed(ids: string[]): Promise<{ ok: boolean; restored: number }> {
+    return api("/api/storage/suppressed/restore", {
+      method: "POST",
+      body: JSON.stringify({ ids }),
+    });
+  },
+
+  reveal(path: string): Promise<{ ok: boolean; path?: string }> {
+    return api("/api/storage/reveal", {
+      method: "POST",
+      body: JSON.stringify({ path }),
     });
   },
 };
@@ -377,6 +645,23 @@ export const ControlApi = {
 
   updateCheck(): Promise<UpdateCheckResult> {
     return api("/api/update/check");
+  },
+
+  updateSources(): Promise<UpdateSourcesResult> {
+    return api("/api/update/sources");
+  },
+
+  updateReleases(opts?: {
+    owner?: string;
+    repo?: string;
+    channel?: "stable" | "beta";
+  }): Promise<UpdateReleasesResult> {
+    const q = new URLSearchParams();
+    if (opts?.owner) q.set("owner", opts.owner);
+    if (opts?.repo) q.set("repo", opts.repo);
+    if (opts?.channel) q.set("channel", opts.channel);
+    const qs = q.toString();
+    return api(`/api/update/releases${qs ? `?${qs}` : ""}`);
   },
 
   setTrayAutostart(autostart: boolean): Promise<TrayAutostartResult> {

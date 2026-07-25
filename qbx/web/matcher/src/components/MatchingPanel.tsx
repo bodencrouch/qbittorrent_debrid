@@ -31,6 +31,7 @@ import { toast } from 'sonner'
 import { Dialogs } from '@wailsio/runtime'
 import { QBitService, MatcherService } from '../../bindings/qbt-file-matcher/backend'
 import type { TorrentFile, DiskFile, MatchInfo } from '../../bindings/qbt-file-matcher/backend/models'
+import { IntegrationService, type ContractReport } from '@/api/backend'
 import { formatSize, getErrorMessage } from '@/lib/utils'
 import type { TorrentInfo } from '@/api/backend'
 
@@ -54,6 +55,23 @@ export function MatchingPanel({ torrent, onBack, compact }: MatchingPanelProps) 
   const [requireSameExtension, setRequireSameExtension] = useState(true)
   const [selectDialogOpen, setSelectDialogOpen] = useState(false)
   const [currentMatchIndex, setCurrentMatchIndex] = useState<number | null>(null)
+  const [contract, setContract] = useState<ContractReport | null>(null)
+  const [isPreviewing, setIsPreviewing] = useState(false)
+  const [previewRenames, setPreviewRenames] = useState<{ old: string; new: string }[]>([])
+
+  const contractBlocked = contract?.status === 'blocked'
+
+  useEffect(() => {
+    let cancelled = false
+    IntegrationService.get()
+      .then((r) => {
+        if (!cancelled) setContract(r)
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const loadTorrentFiles = useCallback(async () => {
     setIsLoading(true)
@@ -148,6 +166,39 @@ export function MatchingPanel({ torrent, onBack, compact }: MatchingPanelProps) 
       }
       return updated
     })
+  }
+
+  const handlePreview = async () => {
+    if (!searchPath) {
+      toast.error('Please enter a directory path')
+      return
+    }
+    setIsPreviewing(true)
+    setPreviewRenames([])
+    try {
+      const result = await MatcherService.Run({
+        hash: torrent.hash,
+        path: searchPath,
+        dry_run: true,
+        require_same_extension: requireSameExtension,
+      })
+      const renames = Array.isArray(result.renames)
+        ? (result.renames as { old?: string; new?: string }[]).map((r) => ({
+            old: String(r.old || ''),
+            new: String(r.new || ''),
+          }))
+        : []
+      setPreviewRenames(renames)
+      if (renames.length === 0) {
+        toast.info('No renames planned for current matches')
+      } else {
+        toast.success(`Preview: ${renames.length} planned rename${renames.length !== 1 ? 's' : ''}`)
+      }
+    } catch (error) {
+      toast.error(`Preview failed: ${getErrorMessage(error)}`)
+    } finally {
+      setIsPreviewing(false)
+    }
   }
 
   const handleApplyRenames = async () => {
@@ -280,7 +331,7 @@ export function MatchingPanel({ torrent, onBack, compact }: MatchingPanelProps) 
                     <TooltipTrigger asChild>
                       <Button 
                         onClick={handleRecheck} 
-                        disabled={isRechecking} 
+                        disabled={contractBlocked || isRechecking} 
                         variant="secondary"
                       >
                         {isRechecking ? (
@@ -305,7 +356,7 @@ export function MatchingPanel({ torrent, onBack, compact }: MatchingPanelProps) 
                     <TooltipTrigger asChild>
                       <Button 
                         onClick={handleSkipUnmatched} 
-                        disabled={isSkipping || isApplying} 
+                        disabled={contractBlocked || isSkipping || isApplying} 
                         variant="outline"
                       >
                         {isSkipping ? (
@@ -325,7 +376,23 @@ export function MatchingPanel({ torrent, onBack, compact }: MatchingPanelProps) 
                 </TooltipProvider>
               )}
               {pendingRenamesCount > 0 && (
-                <Button onClick={handleApplyRenames} disabled={isApplying || isSkipping}>
+                <Button
+                  onClick={handlePreview}
+                  disabled={contractBlocked || isPreviewing || isApplying || isSkipping}
+                  variant="outline"
+                >
+                  {isPreviewing ? (
+                    <>
+                      <Spinner className="mr-2" />
+                      Previewing...
+                    </>
+                  ) : (
+                    'Preview changes'
+                  )}
+                </Button>
+              )}
+              {pendingRenamesCount > 0 && (
+                <Button onClick={handleApplyRenames} disabled={contractBlocked || isApplying || isSkipping}>
                   {isApplying ? (
                     <>
                       <Spinner className="mr-2" />
@@ -391,6 +458,21 @@ export function MatchingPanel({ torrent, onBack, compact }: MatchingPanelProps) 
               Scan the download directory (not content directory) where your files are located. 
               Files will be matched by size and renamed to their relative path from this directory.
             </p>
+            {contractBlocked && (
+              <p className="text-xs text-destructive">
+                Integration contract is blocked — fix path issues in Settings → Application before applying changes.
+              </p>
+            )}
+            {previewRenames.length > 0 && (
+              <div className="rounded-md border border-border/60 bg-muted/20 p-2 text-xs space-y-1 max-h-32 overflow-y-auto">
+                <p className="font-medium text-muted-foreground">Planned renames (preview)</p>
+                {previewRenames.map((r) => (
+                  <div key={`${r.old}->${r.new}`} className="font-mono truncate">
+                    {r.old} → {r.new}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Content area */}
