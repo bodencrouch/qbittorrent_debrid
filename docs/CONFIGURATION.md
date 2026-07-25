@@ -24,10 +24,13 @@ Secrets in `config.toml` are encrypted at rest.
 | `interceptor` | Stall rules, delivery mode, metadata handoff |
 | `matcher` | Size rematch folders; optional auto placement |
 | `content_dupes` | Storage surface roots, protected roots, min size, keeper rule |
+| `arr` | Sonarr / Radarr API URLs and keys (optional, read-only) |
 | `anonymity` | Proxy for debrid / downloads |
 | `updates` | GitHub owner/repo, channel, check on startup |
 | `desktop` | Notifications, tray autostart preference |
 | `server` | Bind host/port, optional API token |
+
+When `server.api_token` is set, mutating API routes and `/api/attention` require the `X-API-Token` header (save the same value in Control Shell → Settings → Application). `/api/health` stays public for liveness probes and exposes lean attention counts plus `attention_requires_token: true` so the Overview can prompt for a token without looking broken.
 
 Storage **suppress** lists (hidden duplicate groups) are operational state in the qbx state dir (`storage-suppressed.jsonl`), not `config.toml`. Quarantine and reclaim audit logs use the same state dir pattern.
 
@@ -62,15 +65,51 @@ In Control Shell → **Settings**:
 
 - `matcher.folders`, `content_dupes.roots`, `content_dupes.protected_roots` — each path must exist, resolve (symlinks), and be writable
 - Optional qBittorrent alignment when WebUI is reachable (default save path, interceptor category filter)
+- Optional Sonarr / Radarr root folder alignment (requires `arr.*` config)
 
 Writability is tested by creating `<root>/.qbx-probe/.write-test` and removing it.
 
 | Severity | Examples | Effect |
 |----------|----------|--------|
 | **Hard** | Missing root, broken symlink, not writable | Status `blocked`; matcher apply/run and storage scan/apply return HTTP 409 |
-| **Soft** | Duplicate paths, protected/scan overlap, qBT save path outside roots | Status `degraded`; automation still allowed |
+| **Soft** | Duplicate paths, protected/scan overlap, qBT save path outside roots, *arr root folder outside qbx roots, *arr download namespace mismatch | Status `degraded`; automation still allowed |
 
 Point matcher folders at your **library** (protected) and **download/incomplete** areas separately. In Docker, paths must match what qBittorrent and *arr apps see inside the container.
+
+## *arr configuration (read-only alignment)
+
+Configure Sonarr / Radarr API access to enable cross-alignment checks in the integration contract:
+
+```toml
+[arr.sonarr]
+enabled = true
+url = "http://sonarr:8989"
+api_key = "your-sonarr-api-key"
+
+[arr.radarr]
+enabled = true
+url = "http://radarr:7878"
+api_key = "your-radarr-api-key"
+```
+
+`qbx check` will:
+
+1. Fetch root folders from each enabled *arr instance.
+2. Warn about any root that falls outside `matcher.folders` / `content_dupes.roots` (path mismatch).
+3. When qBittorrent is also reachable, check that the default save path and per-category `savePath` values share a namespace with at least one *arr root. This catches common Docker volume inconsistency where `/data/torrents` in qBT maps to `/media/downloads` in *arr.
+
+## Attention panel
+
+The **Needs attention** section on the Overview page aggregates signals from multiple sources:
+
+| `kind` | Source | Examples |
+|--------|--------|----------|
+| `contract` | Integration contract | Root missing, qBT path mismatch, *arr root outside qbx roots |
+| `interceptor` | Policy pass | qBT offline, pending candidates, queue frontier |
+| `storage` | Duplicate scan | Reclaimable storage groups |
+| `torrent` | qBT torrents | Stalled downloads / seeds, torrent errors |
+
+Torrent attention rows are polled directly from qBittorrent when the daemon is online. The stalled threshold matches `interceptor.stalled_min_minutes` (default 30 min). The "Act" button opens the vendored qBittorrent WebUI (`/qbt/`) in a new tab.
 
 ## Docker note
 

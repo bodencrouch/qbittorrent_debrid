@@ -9,13 +9,15 @@ Workflow: `ce-brainstorm` (WHAT). Implementation design belongs in `ce-plan`.
 | ID | Requirement | Status |
 |----|-------------|--------|
 | R4 | Exact-content duplicate & hardlink manager | **Shipped** — `StoragePanel`, `/api/storage/*`, `content_dupes` config, quarantine + audit |
-| R2 | Interceptor explain & monitor | Not started |
-| R3 | Matcher show it working | Not started |
-| R7 | Settings guidance system | Not started |
-| R1 | Needs-attention home queue | Not started |
+| R1 | Needs-attention home queue | **Partial** — `GET /api/attention`, `AttentionPanel`, Overview default; contract + storage items only (no stalled/failed torrent rows yet — see B1) |
+| R2 | Interceptor explain & monitor | **Partial** — `InterceptorMonitorPanel` on Overview (live stats, recent decisions, preset guidance); full settings guidance (R7) still thin |
+| R3 | Matcher show it working | **Partial** — matcher activity strip from SSE `matcher.done`; no full stage timeline |
+| R7 | Settings guidance system | **Partial** — `IntegrationHealthPanel` contract checks + snooze; `qbx check --bundle`; interceptor presets on Overview — not all settings fields |
+| R8 | Navigation cleanup | **Partial** — Overview-first IA, attention nav badge, Torrents/Storage toggle; investigation workspace (R5) not shipped |
+| R9 | Peripheral attention badge | **Partial** — nav badge from health summary; SSE-driven refresh not wired (B3) |
 | R5 | Unified investigation workspace | Not started |
 | R6 | Title-similar torrent duplicates | Deferred (after R4) |
-| R8 | Navigation cleanup | Partial — Torrents/Storage shell nav shipped with R4 |
+| R10–R12 | URL state, triage, storage accelerators | Not started — see `docs/brainstorms/2026-07-25-qbx-stabilize-wave-requirements.md` backlog |
 
 **R4 resolved (planning questions):** grouping uses size buckets then full `blake2b` via the existing `HashIndex`; protected roots come from `content_dupes.protected_roots` (falls back to `matcher.folders` for scan roots only); storage state is a dedicated API surface, not derivable from interceptor status alone.
 

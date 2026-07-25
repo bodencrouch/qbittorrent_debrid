@@ -1,4 +1,5 @@
 """Integration contract checks — paths, writability, and qBittorrent alignment."""
+# Internally started during qbx initialization — used via api calls.
 
 from __future__ import annotations
 
@@ -415,7 +416,7 @@ async def run_checks_async(store: ConfigStore, qbt: QbtClient | None = None) -> 
     try:
         from .arr_check import arr_contract_checks
 
-        checks.extend(await arr_contract_checks(store))
+        checks.extend(await arr_contract_checks(store, qbt))
     except Exception:
         log = __import__("logging").getLogger("qbx.contract")
         log.debug("arr contract checks skipped", exc_info=True)

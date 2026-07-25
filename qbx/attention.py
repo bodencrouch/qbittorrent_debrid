@@ -2,11 +2,23 @@
 
 from __future__ import annotations
 
+__all__ = [
+    "AttentionSeverity",
+    "AttentionKind",
+    "AttentionItem",
+    "attention_summary",
+    "build_attention_items",
+    "build_attention_payload",
+]
+
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .contract import ContractReport
+
+log = logging.getLogger("qbx.attention")
 
 AttentionSeverity = Literal["critical", "warning", "info"]
 AttentionKind = Literal[
@@ -15,6 +27,9 @@ AttentionKind = Literal[
     "storage",
     "torrent",
 ]
+
+STALLED_STATES = frozenset({"stalledDL", "stalledUP"})
+ERROR_STATES = frozenset({"error", "missingFiles"})
 
 
 @dataclass
@@ -58,14 +73,81 @@ def attention_summary(items: list[AttentionItem]) -> dict[str, int]:
     }
 
 
+def _stalled_torrent_items(
+    torrents: list[dict],
+    stalled_threshold_sec: int = 1800,
+) -> list[AttentionItem]:
+    """Build ``kind: "torrent"`` attention items from a list of qBT torrent dicts.
+
+    *stalled_threshold_sec* defaults to 1800 (30 min), matching
+    ``interceptor.stalled_min_minutes``.
+    """
+    items: list[AttentionItem] = []
+    now = time.time()
+
+    for t in torrents:
+        state = (t.get("state") or "").lower()
+        name = t.get("name") or t.get("hash", "?")
+        tor_hash = t.get("hash", "")
+        last_activity = t.get("last_activity") or 0
+        idle_sec = now - last_activity if last_activity else 0
+
+        if state in ERROR_STATES:
+            items.append(
+                AttentionItem(
+                    id=f"torrent:error:{tor_hash[:8]}",
+                    kind="torrent",
+                    severity="warning",
+                    title=f"Torrent error: {name[:80]}",
+                    detail=f"qBT state is '{state}' — files may be missing or inaccessible.",
+                    primary_action={"type": "open_qbt"},
+                    href="/qbt/",
+                )
+            )
+        elif state == "stalledDL" and idle_sec > stalled_threshold_sec:
+            pct = round((t.get("progress", 0) or 0) * 100, 1)
+            items.append(
+                AttentionItem(
+                    id=f"torrent:stalled_dl:{tor_hash[:8]}",
+                    kind="torrent",
+                    severity="warning",
+                    title=f"Stalled download: {name[:80]}",
+                    detail=f"{pct}% complete, idle {int(idle_sec // 60)}m.",
+                    primary_action={"type": "open_qbt"},
+                    href="/qbt/",
+                )
+            )
+        elif state == "stalledUP" and idle_sec > stalled_threshold_sec:
+            ratio = round((t.get("ratio", 0) or 0), 2)
+            items.append(
+                AttentionItem(
+                    id=f"torrent:stalled_up:{tor_hash[:8]}",
+                    kind="torrent",
+                    severity="info",
+                    title=f"Stalled seed: {name[:80]}",
+                    detail=f"Ratio {ratio}, idle {int(idle_sec // 60)}m.",
+                    primary_action={"type": "open_qbt"},
+                    href="/qbt/",
+                )
+            )
+
+    items.sort(key=lambda i: ("warning", "info").index(i.severity) if i.severity in ("warning", "info") else 0)
+    return items
+
+
 def build_attention_items(
     *,
     contract: ContractReport | None,
     interceptor: dict[str, Any],
     storage_status: dict[str, Any] | None,
     snoozed_check_ids: set[str] | None = None,
+    torrent_items: list[AttentionItem] | None = None,
 ) -> list[AttentionItem]:
-    """Build actionable attention rows from current daemon state."""
+    """Build actionable attention rows from current daemon state.
+
+    When *torrent_items* is supplied, appends ``kind: "torrent"`` items
+    (pre-built via :func:`_stalled_torrent_items`).
+    """
     items: list[AttentionItem] = []
     now = time.time()
     snoozed = snoozed_check_ids or set()
@@ -185,6 +267,10 @@ def build_attention_items(
                 )
             )
 
+    if torrent_items:
+        torrent_severities = {"warning", "info"}
+        items.extend(t for t in torrent_items if t.severity in torrent_severities)
+
     severity_order = {"critical": 0, "warning": 1, "info": 2}
     items.sort(key=lambda i: (severity_order[i.severity], -i.ts))
     return items
@@ -196,12 +282,14 @@ def build_attention_payload(
     interceptor: dict[str, Any],
     storage_status: dict[str, Any] | None,
     snoozed_check_ids: set[str] | None = None,
+    torrent_items: list[AttentionItem] | None = None,
 ) -> dict[str, Any]:
     items = build_attention_items(
         contract=contract,
         interceptor=interceptor,
         storage_status=storage_status,
         snoozed_check_ids=snoozed_check_ids,
+        torrent_items=torrent_items,
     )
     counts = _count_severities(items)
     return {
