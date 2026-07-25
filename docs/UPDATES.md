@@ -9,12 +9,14 @@ In Control Shell → Settings → Application, or in config:
 ```toml
 [updates]
 channel = "stable"          # or "beta" (allows prereleases)
-source_owner = "youruser"
+source_owner = "bodencrouch"
 source_repo = "qbittorrent_debrid"
 check_on_startup = true
 ```
 
-Empty owner/repo means “do not check.”
+Defaults point at the public upstream (`bodencrouch/qbittorrent_debrid`, also
+linked from [bodecloud.com/qbittorrent_debrid](https://bodecloud.com/qbittorrent_debrid)).
+Blank owner/repo values (from older installs) still resolve to that upstream.
 
 ## What you get
 

@@ -83,21 +83,20 @@ def test_update_check_endpoint_emits_event_when_available(tmp_path, monkeypatch)
     assert "update.available" in kinds
 
 
-def test_update_check_unconfigured_source_is_structured(tmp_path):
+def test_version_defaults_update_source_to_upstream(tmp_path):
     store = ConfigStore(tmp_path)
     store.update({
         "configured": True,
         "interceptor": {"enabled": False, "manage_without_debrid": False},
+        "updates": {"source_owner": "", "source_repo": ""},
     })
 
     app = create_app(store)
     with TestClient(app) as client:
-        res = client.get("/api/update/check")
+        res = client.get("/api/version").json()
 
-    assert res.status_code == 200
-    body = res.json()
-    assert body["ok"] is False
-    assert "not configured" in body["error"]
+    assert res["source"] == {"owner": "bodencrouch", "repo": "qbittorrent_debrid"}
+    assert "bodecloud.com" in res["homepage"]
 
 
 def test_tray_autostart_endpoint_persists_and_syncs(tmp_path, monkeypatch):

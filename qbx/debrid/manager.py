@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 
 from ..config import AppConfig
@@ -146,6 +147,38 @@ class DebridManager:
             raise DebridError(f"{provider.name}: no downloadable files after unrestrict")
 
         return ReadyFileResult(provider=provider.name, torrent_id=torrent_id, files=ready)
+
+    async def cache_magnet(
+        self,
+        magnet: str,
+        *,
+        max_wait_seconds: int = 3600,
+        poll_seconds: int = 15,
+        round_robin: bool = False,
+    ) -> ReadyFileResult:
+        """Add magnet to debrid, select files, and return without downloading locally.
+
+        Tries providers in priority order (or round-robin when enabled).
+        """
+        if not self._providers:
+            raise DebridError("no debrid providers configured")
+
+        providers = list(self._providers)
+        if round_robin and len(providers) > 1:
+            # Rotate so repeated cache-only grabs spread across accounts.
+            shift = int(time.time()) % len(providers)
+            providers = providers[shift:] + providers[:shift]
+
+        last_error: Exception | None = None
+        for provider in providers:
+            try:
+                return await self._resolve_with(
+                    provider, magnet, max_wait_seconds, poll_seconds
+                )
+            except DebridError as exc:
+                log.warning("provider %s failed cache_magnet: %s", provider.name, exc)
+                last_error = exc
+        raise DebridError(f"all providers failed: {last_error}")
 
 
 @dataclass

@@ -27,6 +27,7 @@ from .placement import (
     torrent_eligible,
 )
 from .metadata import magnet_for as _magnet_for
+from .cache_only import reject_reason
 
 log = logging.getLogger("qbx.interceptor")
 
@@ -39,6 +40,8 @@ TAG_DUPLICATE = "qbx-duplicate"
 TAG_STALLED = "qbx-stalled"
 TAG_WEBSEED = "qbx-webseed"
 TAG_SKIP = "qbx-skip"
+TAG_CACHE_DONE = "qbx-cache-done"
+TAG_CACHE_ACTIVE = "qbx-cache-active"
 
 ACTIVE_DOWNLOAD_STATES = {"downloading", "forcedDL"}
 # Only plain stalled downloads are candidates for debrid by default. Metadata
@@ -250,6 +253,7 @@ class Interceptor:
         self._debrid = debrid
         self._events = events
         self._inflight: set[str] = set()
+        self._cache_inflight: set[str] = set()
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._stats = InterceptorStats()
@@ -1541,6 +1545,13 @@ class Interceptor:
         scoped = self._event_scope(torrents)
         self._stats.observed = len(scoped)
         self._observe_torrents(torrents, now)
+        cfg_ic = self._store.config.interceptor
+        if cfg_ic.cache_only_on_add and scoped and self._debrid.enabled:
+            await self._process_cache_only_adds(
+                scoped,
+                previous_torrents or {},
+                event_batch_id=event_batch_id,
+            )
         self._emit_event_feedback(scoped, removed, previous_torrents or {}, queueing_changed)
         if removed:
             self._emit("event.removed", f"qBittorrent removed {len(removed)} torrent(s)", removed=removed)
@@ -1730,7 +1741,12 @@ class Interceptor:
         duplicate_hashes = duplicate_hashes or set()
         cfg = self._store.config.interceptor
         h = t.get("hash", "")
-        if cfg.category_filter and t.get("category", "") != cfg.category_filter:
+        category = t.get("category") or ""
+        if self._is_cache_only_category(category):
+            return False, "cache-only category (handled at add)"
+        if self._is_local_only_category(category):
+            return False, "local-only category"
+        if cfg.category_filter and category != cfg.category_filter:
             return False, f"outside category '{cfg.category_filter}'"
         if not h or h in self._inflight:
             return False, "already in flight or missing hash"
@@ -2516,6 +2532,116 @@ class Interceptor:
         self._sync_torrents[torrent_hash]["tags"] = ",".join(sorted(tags))
 
     # -- per-torrent handling ---------------------------------------------
+
+    def _is_local_only_category(self, category: str) -> bool:
+        local = set(self._store.config.interceptor.local_only_categories or [])
+        return category in local
+
+    def _is_cache_only_category(self, category: str) -> bool:
+        cats = set(self._store.config.interceptor.cache_only_categories or [])
+        return bool(cats) and category in cats
+
+    async def _process_cache_only_adds(
+        self,
+        torrents: list[dict],
+        previous_torrents: dict[str, dict],
+        *,
+        event_batch_id: int | None = None,
+    ) -> None:
+        for t in torrents:
+            h = t.get("hash") or ""
+            if not h or h in previous_torrents:
+                continue
+            if h in self._cache_inflight or h in self._inflight:
+                continue
+            tags = {s.strip() for s in (t.get("tags") or "").split(",") if s.strip()}
+            if TAG_CACHE_DONE in tags or TAG_CACHE_ACTIVE in tags or TAG_FAILED in tags:
+                continue
+            category = t.get("category") or ""
+            if not self._is_cache_only_category(category):
+                continue
+            if self._is_local_only_category(category):
+                continue
+            asyncio.create_task(
+                self._handle_cache_only(t, event_batch_id=event_batch_id),
+                name=f"qbx-cache-only-{h[:8]}",
+            )
+
+    async def _handle_cache_only(
+        self,
+        t: dict,
+        *,
+        event_batch_id: int | None = None,
+    ) -> None:
+        h = t["hash"]
+        name = t.get("name", h)
+        cfg = self._store.config.interceptor
+        self._cache_inflight.add(h)
+        try:
+            reason = reject_reason(name, int(t.get("total_size") or t.get("size") or 0) or None)
+            if reason:
+                await self._qbt.add_tags(h, TAG_FAILED)
+                self._sync_local_tags(h, add={TAG_FAILED})
+                self._emit(
+                    "cache.rejected",
+                    f"Cache-only rejected '{name}': {reason}",
+                    event_batch_id=event_batch_id,
+                    hash=h,
+                    name=name,
+                    reason=reason,
+                )
+                return
+
+            await self._qbt.pause(h)
+            await self._qbt.add_tags(h, TAG_CACHE_ACTIVE)
+            self._sync_local_tags(h, add={TAG_CACHE_ACTIVE})
+            self._emit(
+                "cache.start",
+                f"Caching '{name}' on debrid (no local download)",
+                event_batch_id=event_batch_id,
+                hash=h,
+                name=name,
+                category=t.get("category", ""),
+            )
+
+            magnet = _magnet_for(t)
+            result = await self._debrid.cache_magnet(
+                magnet,
+                max_wait_seconds=cfg.max_wait_minutes * 60,
+                poll_seconds=cfg.poll_seconds,
+                round_robin=cfg.provider_round_robin,
+            )
+
+            await self._qbt.add_tags(h, TAG_CACHE_DONE)
+            await self._qbt.remove_tags(h, TAG_CACHE_ACTIVE)
+            self._sync_local_tags(h, add={TAG_CACHE_DONE}, remove={TAG_CACHE_ACTIVE})
+
+            if cfg.cache_only_remove_torrent:
+                await self._qbt.delete(h, delete_files=False)
+                self._sync_torrents.pop(h, None)
+
+            self._emit(
+                "cache.done",
+                f"Cached '{name}' on {result.provider} ({len(result.files)} file(s))",
+                event_batch_id=event_batch_id,
+                hash=h,
+                name=name,
+                provider=result.provider,
+                files=len(result.files),
+            )
+        except Exception as exc:
+            await self._qbt.add_tags(h, TAG_FAILED)
+            self._sync_local_tags(h, add={TAG_FAILED}, remove={TAG_CACHE_ACTIVE})
+            self._emit(
+                "cache.failed",
+                f"Cache-only failed for '{name}': {exc}",
+                event_batch_id=event_batch_id,
+                hash=h,
+                name=name,
+                error=str(exc),
+            )
+        finally:
+            self._cache_inflight.discard(h)
 
     async def _handle(
         self,
