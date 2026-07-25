@@ -3,7 +3,7 @@
 ## Clone and install
 
 ```bash
-git clone https://github.com/oldrepublicwizard/qbittorrent_debrid.git
+git clone https://github.com/bodencrouch/qbittorrent_debrid.git
 cd qbittorrent_debrid
 ./install.sh
 ```

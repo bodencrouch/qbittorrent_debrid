@@ -2,7 +2,7 @@
 
 Plain-language guides for installing and running qbx. The browsable site is built from `website/` and published to GitHub Pages.
 
-**Site:** [oldrepublicwizard.github.io/qbittorrent_debrid](https://oldrepublicwizard.github.io/qbittorrent_debrid/)
+**Site:** [bodencrouch.github.io/qbittorrent_debrid](https://bodencrouch.github.io/qbittorrent_debrid/)
 
 ## Start here
 

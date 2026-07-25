@@ -4,7 +4,7 @@
 
 It also helps when the files are already on disk: match by size, remap paths, or (optionally) place copies by content hash.
 
-**Docs site:** [oldrepublicwizard.github.io/qbittorrent_debrid](https://oldrepublicwizard.github.io/qbittorrent_debrid/)
+**Docs site:** [bodencrouch.github.io/qbittorrent_debrid](https://bodencrouch.github.io/qbittorrent_debrid/)
 
 ## What you need
 
@@ -16,7 +16,7 @@ It also helps when the files are already on disk: match by size, remap paths, or
 ## Install on a desktop (Linux / KDE)
 
 ```bash
-git clone https://github.com/oldrepublicwizard/qbittorrent_debrid.git
+git clone https://github.com/bodencrouch/qbittorrent_debrid.git
 cd qbittorrent_debrid
 ./scripts/install-local.sh
 ```
@@ -64,7 +64,7 @@ Optional extras: size-based file matching, automatic content-hash placement, des
 
 | Topic | Where |
 |-------|--------|
-| Full docs (GitHub Pages) | [Website](https://oldrepublicwizard.github.io/qbittorrent_debrid/) |
+| Full docs (GitHub Pages) | [Website](https://bodencrouch.github.io/qbittorrent_debrid/) |
 | Getting started | [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) |
 | Configuration | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | Architecture | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |

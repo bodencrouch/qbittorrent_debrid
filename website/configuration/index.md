@@ -32,6 +32,6 @@ default_keeper_rule = "newest"
 
 Edits to `content_dupes` are soft patches: they apply without rebinding qBittorrent or the interceptor.
 
-Full write-up in the repo: [`docs/CONFIGURATION.md`](https://github.com/oldrepublicwizard/qbittorrent_debrid/blob/main/docs/CONFIGURATION.md).
+Full write-up in the repo: [`docs/CONFIGURATION.md`](https://github.com/bodencrouch/qbittorrent_debrid/blob/main/docs/CONFIGURATION.md).
 
 See also [Environment variables](./env).

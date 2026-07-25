@@ -7,6 +7,6 @@ pytest
 cd website && npm ci && npm run build
 ```
 
-Guidelines: [AGENTS.md](https://github.com/oldrepublicwizard/qbittorrent_debrid/blob/main/AGENTS.md) in the repo.
+Guidelines: [AGENTS.md](https://github.com/bodencrouch/qbittorrent_debrid/blob/main/AGENTS.md) in the repo.
 
 Docs site source is `website/` (VitePress). Repo guides also live under `docs/`. Keep both in plain language when you change behavior users see.
