@@ -15,6 +15,33 @@ Config dir: ``~/.config/qbx`` (override with ``QBX_CONFIG_DIR``).
 
 from __future__ import annotations
 
+__all__ = [
+    "ConfigStore",
+    "config_dir",
+    "ServerConfig",
+    "QbtConfig",
+    "DebridProviderConfig",
+    "AnonymityConfig",
+    "InterceptorConfig",
+    "DuplicatesConfig",
+    "MatcherConfig",
+    "ContentDupesConfig",
+    "WatchFolderRule",
+    "AutomationConfig",
+    "QualityConfig",
+    "UpdatesConfig",
+    "DesktopConfig",
+    "ArrServiceConfig",
+    "ArrConfig",
+    "AppConfig",
+    "REDACTED",
+    "config_patch_is_soft",
+    "apply_provider_env_keys",
+    "load_provisional_yaml",
+    "cli_overrides_from_args",
+    "apply_provider_upserts",
+]
+
 import json
 import os
 import sys
@@ -704,4 +731,10 @@ class ConfigStore:
         if proxy and "@" in proxy:
             # Hide embedded credentials in proxy URLs (user:pass@host).
             data["anonymity"]["proxy_url"] = REDACTED
+        arr = data.get("arr")
+        if isinstance(arr, dict):
+            for svc_name in ("sonarr", "radarr"):
+                svc = arr.get(svc_name, {})
+                if isinstance(svc, dict) and svc.get("api_key"):
+                    svc["api_key"] = REDACTED
         return data

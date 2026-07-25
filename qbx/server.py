@@ -8,6 +8,11 @@ Serves:
 
 from __future__ import annotations
 
+__all__ = [
+    "AppState",
+    "create_app",
+]
+
 import asyncio
 import logging
 import time
@@ -145,12 +150,29 @@ async def _require_contract_ok(state: AppState) -> None:
 async def _attention_for_state(state: AppState) -> dict:
     contract = await _refresh_contract(state)
     snoozed = _load_snoozed_check_ids(state.store)
+    torrent_items = await _torrent_attention(state)
     return build_attention_payload(
         contract=contract,
         interceptor=state.interceptor.stats,
         storage_status=state.storage_service().status(),
         snoozed_check_ids=snoozed,
+        torrent_items=torrent_items,
     )
+
+
+async def _torrent_attention(state: AppState) -> list | None:
+    from .attention import _stalled_torrent_items
+
+    try:
+        torrents = await state.qbt.torrents(filter="all")
+    except Exception:
+        log.debug("torrent attention poll failed", exc_info=True)
+        return None
+    if not torrents:
+        return None
+    cfg = state.store.config.interceptor
+    threshold = max(cfg.stalled_min_minutes, 5) * 60
+    return _stalled_torrent_items(torrents, stalled_threshold_sec=threshold)
 
 
 def _load_snoozed_check_ids(store: ConfigStore) -> set[str]:
@@ -318,11 +340,13 @@ def _register_routes(app: FastAPI) -> None:
         """
         state: AppState = request.app.state.qbx
         contract = _contract_summary(await _refresh_contract(state))
+        torrent_items = await _torrent_attention(state)
         attn_items = build_attention_items(
             contract=state.contract_report,
             interceptor=state.interceptor.stats,
             storage_status=state.storage_service().status(),
             snoozed_check_ids=_load_snoozed_check_ids(state.store),
+            torrent_items=torrent_items,
         )
         attention = attention_summary(attn_items)
         full = state.interceptor.stats
@@ -347,11 +371,19 @@ def _register_routes(app: FastAPI) -> None:
             )
             if k in full
         }
+        ok = (
+            state.store.config.configured
+            and state.debrid.enabled
+            and state.interceptor.running
+            and state.automation.running
+            and contract["status"] == "ok"
+        )
         return {
-            "ok": True,
+            "ok": ok,
             "app": "qbx",
             "version": __version__,
             "configured": state.store.config.configured,
+            "attention_requires_token": bool(state.store.config.server.api_token),
             "debrid_enabled": state.debrid.enabled,
             "interceptor_running": state.interceptor.running,
             "automation_running": state.automation.running,

@@ -2122,7 +2122,7 @@ def torrent(
     last_activity: int = 0,
     added_on: int | None = None,
     tags: str = "",
-    category: str = "",
+    category: str = "radarr",
 ):
     added_on = last_activity if added_on is None else added_on
     torrent = {

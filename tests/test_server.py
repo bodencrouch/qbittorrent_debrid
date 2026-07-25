@@ -1007,8 +1007,61 @@ def test_attention_endpoint_shape(tmp_path):
         assert "attention" in health
         assert "open_count" in health["attention"]
         assert "critical_count" in health["attention"]
+        assert health.get("attention_requires_token") is False
 
         payload = client.get("/api/attention").json()
         assert "items" in payload
         assert "counts" in payload
         assert set(payload["counts"]) == {"critical", "warning", "info"}
+
+
+def test_attention_requires_token_when_api_token_set(tmp_path):
+    store = ConfigStore(tmp_path / "cfg")
+    store.update({
+        "configured": True,
+        "server": {"api_token": "secret-token"},
+        "interceptor": {"enabled": False, "manage_without_debrid": False},
+    })
+    app = create_app(store)
+    with TestClient(app) as client:
+        health = client.get("/api/health").json()
+        assert health["attention_requires_token"] is True
+        assert client.get("/api/attention").status_code == 401
+        res = client.get("/api/attention", headers={"X-API-Token": "secret-token"})
+        assert res.status_code == 200
+        assert "items" in res.json()
+
+
+def test_contract_snooze_soft_check(tmp_path):
+    root = tmp_path / "media"
+    root.mkdir()
+    store = ConfigStore(tmp_path / "cfg")
+    store.update({
+        "configured": True,
+        "interceptor": {"enabled": False, "manage_without_debrid": False},
+        "matcher": {"folders": []},
+        "content_dupes": {"roots": [], "protected_roots": []},
+    })
+    app = create_app(store)
+    with TestClient(app) as client:
+        contract = client.get("/api/integration/contract").json()
+        soft = next(c for c in contract["checks"] if c["severity"] == "soft")
+        res = client.post(
+            "/api/integration/contract/snooze",
+            json={"check_id": soft["id"], "days": 1},
+        )
+        assert res.status_code == 200
+        assert res.json()["ok"] is True
+
+
+def test_contract_snooze_rejects_hard_check(tmp_path):
+    app = create_app(_contract_blocked_store(tmp_path))
+    with TestClient(app) as client:
+        contract = client.get("/api/integration/contract").json()
+        hard = next(c for c in contract["checks"] if c["severity"] == "hard")
+        res = client.post(
+            "/api/integration/contract/snooze",
+            json={"check_id": hard["id"]},
+        )
+        assert res.status_code == 400
+        assert "hard" in res.json()["detail"].lower()

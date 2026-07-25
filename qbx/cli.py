@@ -17,7 +17,7 @@ import json
 import logging
 import sys
 import zipfile
-from datetime import datetime
+from datetime import datetime, UTC
 from pathlib import Path
 
 import httpx
@@ -71,6 +71,12 @@ def main(argv: list[str] | None = None) -> int:
         help="enable/disable anonymity/proxy layer",
     )
 
+    p_serve.add_argument(
+        "--allow-unconfigured",
+        action="store_true",
+        help="start even when qbx setup has not been completed",
+    )
+
     sub.add_parser("setup", help="interactive configuration wizard")
     p_check = sub.add_parser("check", help="validate qBittorrent, debrid, and path contract")
     p_check.add_argument("--json", action="store_true", help="emit machine-readable JSON")
@@ -111,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
     _configure_logging(store.config.server.log_level)
 
     if args.command == "serve":
-        return _serve(store, args.host, args.port)
+        return _serve(store, args.host, args.port, allow_unconfigured=args.allow_unconfigured)
     if args.command == "setup":
         return _setup(store)
     if args.command == "check":
@@ -124,13 +130,23 @@ def main(argv: list[str] | None = None) -> int:
     return 1
 
 
-def _serve(store: ConfigStore, host: str | None, port: int | None) -> int:
+def _serve(
+    store: ConfigStore,
+    host: str | None,
+    port: int | None,
+    *,
+    allow_unconfigured: bool = False,
+) -> int:
     import uvicorn
 
     from .server import create_app
 
-    if not store.config.configured:
-        print("qbx is not configured yet. Run `qbx setup` first.", file=sys.stderr)
+    if not store.config.configured and not allow_unconfigured:
+        print(
+            "qbx is not configured yet. Run `qbx setup` first, or pass --allow-unconfigured.",
+            file=sys.stderr,
+        )
+        return 1
     app = create_app(store)
     bind_host = host or store.config.server.host
     bind_port = port or store.config.server.port
@@ -286,7 +302,7 @@ def _write_check_bundle(store: ConfigStore, cred: dict, contract) -> Path:
 
     out_dir = store.dir / "diagnostics"
     out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     zip_path = out_dir / f"qbx-check-{stamp}.zip"
     config_redacted = store.redacted()
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
