@@ -25,6 +25,7 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",
     "tomli-w>=1.0",
     "PyYAML>=6.0",
+    "python-multipart",
 ]
 
 [project.optional-dependencies]

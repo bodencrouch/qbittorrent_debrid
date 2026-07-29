@@ -126,8 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_nudge(store, args))
     if args.command == "match":
         return asyncio.run(_match(store, args))
-    parser.print_help()
-    return 1
+    return _serve(store, None, None)
 
 
 def _serve(
@@ -224,7 +223,11 @@ def _setup(store: ConfigStore) -> int:
         "Tip: point matcher folders at your library (protected) and download/incomplete areas separately.\n"
         "In Docker, paths must match what qBittorrent and *arr apps see inside the container.\n"
     )
-    return asyncio.run(_check(store, json_output=False))
+    result = asyncio.run(_check(store, json_output=False))
+    if result != 0:
+        return result
+    print("\nSetup complete — launching the server...")
+    return _serve(store, None, None)
 
 
 async def _check(store: ConfigStore, *, json_output: bool = False, bundle: bool = False) -> int:

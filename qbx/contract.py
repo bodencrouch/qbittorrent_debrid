@@ -425,4 +425,5 @@ async def run_checks_async(store: ConfigStore, qbt: QbtClient | None = None) -> 
 
 def run_checks(store: ConfigStore, qbt: QbtClient | None = None) -> ContractReport:
     """Synchronous entry — filesystem only unless *qbt* checks are run via async helper."""
+    store.reload()
     return _aggregate(_filesystem_checks(store))
