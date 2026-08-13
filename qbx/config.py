@@ -27,6 +27,7 @@ __all__ = [
     "MatcherConfig",
     "MatcherRuleConfig",
     "ContentDupesConfig",
+    "CrossLinkConfig",
     "WatchFolderRule",
     "AutomationConfig",
     "QualityConfig",
@@ -89,8 +90,10 @@ _SOFT_TOP_LEVEL = frozenset({
     "matcher",
     "duplicates",
     "content_dupes",
+    "cross_link",
     "quality",
     "arr",
+    "contract",
 })
 
 # Interceptor knobs read live from ConfigStore each scan. ``enabled`` is
@@ -124,10 +127,28 @@ _SOFT_INTERCEPTOR_KEYS = frozenset({
     "tag_candidates",
     "reannounce_before_debrid",
     "reannounce_cooldown_minutes",
+    "max_reannounce_per_scan",
+    "auto_retry_failed",
+    "retry_backoff_minutes",
+    "max_retry_attempts",
+    "max_retries_per_scan",
+    "post_intercept_stall_minutes",
+    "post_intercept_max_escalations_per_scan",
+    "attention_include_local_only",
+    "auto_replace_enabled",
+    "max_replacements_per_scan",
     "metadata_handoff",
     "metadata_sources",
     "metadata_fetch_timeout_seconds",
     "metadata_wait_seconds",
+    "policy_min_interval_seconds",
+    "webseed_cache_seconds",
+    "stall_after_seconds",
+    "file_stall_sample_budget_per_pass",
+    "webseed_validate_budget_per_pass",
+    "webseed_validate_cooldown_seconds",
+    "download_only",
+    "download_only_stop_budget_per_pass",
 })
 
 
@@ -167,7 +188,7 @@ class QbtConfig(BaseModel):
 
 
 class DebridProviderConfig(BaseModel):
-    name: Literal["realdebrid", "alldebrid"]
+    name: Literal["realdebrid", "alldebrid", "premiumize"]
     api_key: str = ""  # secret
     enabled: bool = True
     priority: int = 0  # lower = tried first
@@ -188,7 +209,43 @@ class InterceptorConfig(BaseModel):
     poll_seconds: int = 15
     sync_poll_seconds: int = 5
     health_scan_seconds: int = 60
-    # Categories that cache on debrid at add-time (no local download).
+    # Minimum seconds between full event-driven policy passes. Sync batches
+    # can land every few seconds on a busy library, and each full pass walks
+    # every torrent. Batches that add or remove torrents always run
+    # immediately; manual scans are never debounced. 0 disables the debounce.
+    policy_min_interval_seconds: int = 30
+    # Per-torrent TTL for cached torrents/webseeds lookups. The staleness
+    # sweep re-reads the same URLs every pass; the cache is invalidated when
+    # qbx adds or removes webseeds for a torrent. 0 disables the cache.
+    webseed_cache_seconds: int = 300
+    # A file (or a single-file torrent) counts as stalled for the debrid
+    # offload path once its progress has not moved for this long. Multi-file
+    # torrents track per-file progress in the file-stall ledger; single-file
+    # torrents use the torrent's last_activity from the sync snapshot.
+    # 0 disables the gate (offload as soon as the other stall checks pass).
+    stall_after_seconds: int = 86400
+    # How many stalled multi-file torrents get one torrents/files sample per
+    # policy pass (oldest-sampled-first). Bounds per-file ledger upkeep on
+    # large libraries; never sweeps the whole library in one pass.
+    file_stall_sample_budget_per_pass: int = 20
+    # Webseed validation on state changes (a torrent entering a download
+    # state or restarting gets its webseed URLs HEAD-checked, dead ones
+    # removed/refreshed). Budgeted per event batch, deduped per torrent.
+    webseed_validate_budget_per_pass: int = 10
+    webseed_validate_cooldown_seconds: int = 1800
+    # Download-only enforcement: share limits are set to ratio 0 with the
+    # Stop action on webseed injection and completion, and torrents seen
+    # seeding are stopped (budgeted per pass). Never uses upload limits
+    # (setUploadLimit 0 means unlimited) and never enables super seeding.
+    download_only: bool = True
+    download_only_stop_budget_per_pass: int = 50
+    # Categories that cache on debrid at add-time (no local download). Torrents
+    # in these categories are paused for the duration of caching and, once
+    # cached, are tagged qbx-cache-done and left paused permanently rather
+    # than resumed locally -- caching intentionally means "never download
+    # this one," not "download it later." If cache_only_remove_torrent is
+    # False, that permanent pause is what an operator sees in qBittorrent;
+    # it is expected, not a stuck torrent.
     cache_only_categories: list[str] = Field(default_factory=list)
     cache_only_on_add: bool = False
     cache_only_remove_torrent: bool = True
@@ -203,7 +260,7 @@ class InterceptorConfig(BaseModel):
     download_dir: str = ""  # "" = use the torrent's qBittorrent save path
     max_parallel_downloads: int = 1
     manage_without_debrid: bool = True
-    # webseed = inject unrestricted URLs into qBittorrent; download = legacy in-process
+    # webseed = inject unrestricted URLs into qBittorrent; download = in-process fetch (compatibility fallback)
     delivery_mode: Literal["webseed", "download"] = "webseed"
     # When true, only plain stalledDL torrents are debrid candidates.
     stalled_only: bool = True
@@ -218,6 +275,37 @@ class InterceptorConfig(BaseModel):
     tag_candidates: bool = True
     reannounce_before_debrid: bool = True
     reannounce_cooldown_minutes: int = 15
+    # Caps how many torrents can be reannounced in one pass. Without a cap,
+    # a large library where many torrents' cooldowns lapse around the same
+    # time (e.g. right after a restart) sends a single reannounce for
+    # thousands of torrents at once — a tracker/network burst that itself
+    # contributes to the box feeling sluggish for a few seconds.
+    max_reannounce_per_scan: int = 200
+    # Automatically re-candidate qbx-failed torrents instead of requiring a
+    # manual "Retry failed" click. Backoff/attempt-capped so a genuinely
+    # broken torrent doesn't retry forever or compete unbounded with fresh
+    # candidates on a large library.
+    auto_retry_failed: bool = True
+    retry_backoff_minutes: int = 60
+    max_retry_attempts: int = 3
+    max_retries_per_scan: int = 50
+    # Escalation for torrents qbx already routed through webseed delivery
+    # that then stop making progress inside qBittorrent for reasons the
+    # webseed-liveness check (_check_stale_webseeds, an HTTP HEAD probe)
+    # doesn't catch -- e.g. the URL responds but qBittorrent isn't pulling
+    # from it. 0 disables the sweep.
+    post_intercept_stall_minutes: int = 45
+    post_intercept_max_escalations_per_scan: int = 20
+    # Attention rows for qbx-owned pauses skip local_only/cache_only
+    # categories by default, matching the stalled-torrent check's existing
+    # category policy (W2-2). Opt in to surface them anyway.
+    attention_include_local_only: bool = False
+    # After a torrent exhausts max_retry_attempts, search *arr for an
+    # alternative release instead of leaving it permanently qbx-failed.
+    # Off by default -- it changes what's in the library without a direct
+    # operator action, so it's opt-in.
+    auto_replace_enabled: bool = False
+    max_replacements_per_scan: int = 10
     # Before webseed inject, fetch a matching .torrent when qBT lacks metadata.
     metadata_handoff: bool = True
     metadata_sources: list[str] = Field(default_factory=lambda: list(DEFAULT_METADATA_SOURCES))
@@ -275,11 +363,11 @@ class MatcherConfig(BaseModel):
     renameFile. Automatic placement (when ``enabled`` and ``auto_placement``)
     moves orphans / hardlinks owned matches to the torrent's expected paths.
     
-    Supports both legacy simple folder list and new rule-based configuration.
+    Supports both the plain folder list and the rule-based configuration.
     """
 
     enabled: bool = False
-    # Legacy: simple list of folders to search (backward compatible)
+    # Plain folder list to search (kept for backward compatibility)
     folders: list[str] = Field(default_factory=list)
     interval_minutes: int = 60
     min_name_similarity: float = 0.72  # retained for future fuzzy modes
@@ -295,6 +383,10 @@ class MatcherConfig(BaseModel):
     max_hash_bytes_per_pass: int = 8 * 1024 * 1024 * 1024
     max_rechecks_per_pass: int = 10
     allow_cross_device_copy: bool = False  # reserved; EXDEV always skips today
+    # A torrent skipped this many auto-placement passes in a row (no move/
+    # hardlink landed) is treated as a terminal matcher failure for the
+    # attention queue, rather than a transient "not ready yet" skip.
+    placement_terminal_skip_threshold: int = 3
     
     # New: rule-based configuration for dynamic path matching
     # When rules are defined, they take precedence over the simple folders list
@@ -333,6 +425,26 @@ class ContentDupesConfig(BaseModel):
     max_age_days: int = 0
     # Skip hidden files/directories
     skip_hidden: bool = True
+
+
+class CrossLinkConfig(BaseModel):
+    """Cross-torrent duplicate-file linking (S10).
+
+    When the same content exists in two torrents, the complete copy is
+    hardlinked into the incomplete torrent's expected path. Write safety
+    (decision D5): only complete, hash-verified copies are ever linked; the
+    target torrent stays stopped until a recheck confirms the linked file;
+    partial target data is never overwritten; cross-device links are skipped.
+    """
+
+    enabled: bool = True
+    # Files below this size are never catalogued or linked.
+    min_size_bytes: int = 1024 * 1024
+    # Auto-links attempted per completion pass.
+    link_budget_per_pass: int = 5
+    # How long to wait for a post-link recheck before giving up (torrent
+    # stays stopped on timeout — never started on an unverified link).
+    recheck_timeout_seconds: int = 900
 
 
 class WatchFolderRule(BaseModel):
@@ -409,6 +521,12 @@ class ArrConfig(BaseModel):
     radarr: ArrServiceConfig = Field(default_factory=ArrServiceConfig)
 
 
+class ContractConfig(BaseModel):
+    disk_space_check_enabled: bool = True
+    disk_warn_free_ratio: float = 0.10
+    disk_hard_free_ratio: float = 0.05
+
+
 class AppConfig(BaseModel):
     configured: bool = False  # flipped by onboarding wizard / `qbx setup`
     server: ServerConfig = Field(default_factory=ServerConfig)
@@ -418,12 +536,14 @@ class AppConfig(BaseModel):
     interceptor: InterceptorConfig = Field(default_factory=InterceptorConfig)
     duplicates: DuplicatesConfig = Field(default_factory=DuplicatesConfig)
     content_dupes: ContentDupesConfig = Field(default_factory=ContentDupesConfig)
+    cross_link: CrossLinkConfig = Field(default_factory=CrossLinkConfig)
     matcher: MatcherConfig = Field(default_factory=MatcherConfig)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
     quality: QualityConfig = Field(default_factory=QualityConfig)
     updates: UpdatesConfig = Field(default_factory=UpdatesConfig)
     desktop: DesktopConfig = Field(default_factory=DesktopConfig)
     arr: ArrConfig = Field(default_factory=ArrConfig)
+    contract: ContractConfig = Field(default_factory=ContractConfig)
 
 
 def config_dir() -> Path:
@@ -488,10 +608,13 @@ _PROVIDER_ENV_SKIP = frozenset({
     "QBX_CONFIG_DIR",
     "QBX_REALDEBRID_API_KEY",
     "QBX_ALLDEBRID_API_KEY",
+    "QBX_PREMIUMIZE_API_KEY",
     "QBX_REALDEBRID_ENABLED",
     "QBX_ALLDEBRID_ENABLED",
+    "QBX_PREMIUMIZE_ENABLED",
     "QBX_REALDEBRID_PRIORITY",
     "QBX_ALLDEBRID_PRIORITY",
+    "QBX_PREMIUMIZE_PRIORITY",
 })
 
 
@@ -515,7 +638,7 @@ def _upsert_provider(
             if api_key:
                 p["enabled"] = True if enabled is None else enabled
             return out
-    default_priority = 0 if name == "alldebrid" else 1
+    default_priority = {"alldebrid": 0, "realdebrid": 1, "premiumize": 2}.get(name, 1)
     out.append({
         "name": name,
         "api_key": api_key or "",
@@ -553,7 +676,11 @@ def apply_provider_env_keys(data: dict[str, Any], environ: dict[str, str] | None
     providers = list(data.get("providers") or [])
     changed = False
 
-    for name, prefix in (("realdebrid", "QBX_REALDEBRID"), ("alldebrid", "QBX_ALLDEBRID")):
+    for name, prefix in (
+        ("realdebrid", "QBX_REALDEBRID"),
+        ("alldebrid", "QBX_ALLDEBRID"),
+        ("premiumize", "QBX_PREMIUMIZE"),
+    ):
         key = env.get(f"{prefix}_API_KEY")
         if key is not None and not str(key).strip():
             key = None
@@ -605,8 +732,10 @@ def cli_overrides_from_args(
     qbt_password: str | None = None,
     realdebrid_api_key: str | None = None,
     alldebrid_api_key: str | None = None,
+    premiumize_api_key: str | None = None,
     realdebrid_enabled: bool | None = None,
     alldebrid_enabled: bool | None = None,
+    premiumize_enabled: bool | None = None,
     proxy_url: str | None = None,
     proxy_enabled: bool | None = None,
     server_host: str | None = None,
@@ -644,6 +773,13 @@ def cli_overrides_from_args(
             api_key=alldebrid_api_key,
             enabled=alldebrid_enabled,
         )
+    if premiumize_api_key is not None or premiumize_enabled is not None:
+        providers = _upsert_provider(
+            providers,
+            "premiumize",
+            api_key=premiumize_api_key,
+            enabled=premiumize_enabled,
+        )
     if providers:
         patch["_provider_upserts"] = providers
     return patch
@@ -653,7 +789,7 @@ def apply_provider_upserts(data: dict[str, Any], upserts: list[dict]) -> dict[st
     providers = list(data.get("providers") or [])
     for item in upserts:
         name = item.get("name")
-        if name not in {"realdebrid", "alldebrid"}:
+        if name not in {"realdebrid", "alldebrid", "premiumize"}:
             continue
         providers = _upsert_provider(
             providers,

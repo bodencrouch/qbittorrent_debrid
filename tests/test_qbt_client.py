@@ -138,3 +138,60 @@ async def test_set_file_priority_joins_ids(monkeypatch):
         assert captured["data"] == {"hash": "h", "id": "0|2", "priority": 0}
     finally:
         await client.aclose()
+
+
+async def test_set_share_limits_sends_stop_action_when_supported(monkeypatch):
+    client = QbtClient(QbtConfig(url="http://127.0.0.1:8084"))
+    client._authed = True
+    client._webseed_supported = True  # same >= 2.11 probe gates shareLimitAction
+    captured: dict = {}
+
+    async def fake_request(method, path, **kwargs):
+        captured["path"] = path
+        captured["data"] = kwargs.get("data")
+        return httpx.Response(200, request=httpx.Request(method, path), text="")
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    try:
+        await client.set_share_limits(
+            ["h1", "h2"],
+            ratio_limit=0,
+            seeding_time_limit=0,
+            inactive_seeding_time_limit=0,
+            share_limit_action="Stop",
+        )
+        assert captured["path"] == "/torrents/setShareLimits"
+        assert captured["data"] == {
+            "hashes": "h1|h2",
+            "ratioLimit": 0,
+            "seedingTimeLimit": 0,
+            "inactiveSeedingTimeLimit": 0,
+            "shareLimitAction": "Stop",
+        }
+    finally:
+        await client.aclose()
+
+
+async def test_set_share_limits_omits_action_on_older_webapi(monkeypatch):
+    client = QbtClient(QbtConfig(url="http://127.0.0.1:8084"))
+    client._authed = True
+    client._webseed_supported = False
+    captured: dict = {}
+
+    async def fake_request(method, path, **kwargs):
+        captured["data"] = kwargs.get("data")
+        return httpx.Response(200, request=httpx.Request(method, path), text="")
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    try:
+        await client.set_share_limits(
+            "h1",
+            ratio_limit=0,
+            seeding_time_limit=0,
+            inactive_seeding_time_limit=0,
+            share_limit_action="Stop",
+        )
+        assert "shareLimitAction" not in captured["data"]
+        assert captured["data"]["ratioLimit"] == 0
+    finally:
+        await client.aclose()

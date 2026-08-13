@@ -14,7 +14,15 @@ import logging
 
 from ..anonymity import scrub_magnet
 from ..config import AnonymityConfig
-from .base import DebridError, DebridFile, DebridProvider, DebridStatus, TorrentState
+from .base import (
+    DebridError,
+    DebridFile,
+    DebridProvider,
+    DebridStatus,
+    TorrentState,
+    WantedFile,
+    matches_wanted,
+)
 
 log = logging.getLogger("qbx.debrid.rd")
 
@@ -81,6 +89,48 @@ class RealDebrid(DebridProvider):
     async def select_all(self, torrent_id: str) -> None:
         await self._call("POST", f"/torrents/selectFiles/{torrent_id}", data={"files": "all"})
 
+    async def select_files(self, torrent_id: str, wanted: list[WantedFile] | None = None) -> None:
+        """Select only the RD file ids matching *wanted*; fall back to all.
+
+        Falls back to ``files=all`` when no wanted list is given or when
+        matching against RD's file listing fails (empty listing right after
+        a magnet add, API error, or nothing matched) — logged either way.
+        """
+        if not wanted:
+            await self.select_all(torrent_id)
+            return
+        ids: list[str] = []
+        try:
+            info = await self._call("GET", f"/torrents/info/{torrent_id}")
+            files = info.get("files") if isinstance(info, dict) else None
+            for f in files or []:
+                if not isinstance(f, dict) or f.get("id") is None:
+                    continue
+                if matches_wanted(str(f.get("path") or ""), int(f.get("bytes") or 0), wanted):
+                    ids.append(str(f["id"]))
+        except DebridError as exc:
+            log.warning(
+                "RD per-file selection lookup failed for %s (%s); falling back to files=all",
+                torrent_id,
+                exc,
+            )
+            await self.select_all(torrent_id)
+            return
+        if not ids:
+            log.warning(
+                "RD per-file selection matched none of %d wanted file(s) for %s; "
+                "falling back to files=all",
+                len(wanted),
+                torrent_id,
+            )
+            await self.select_all(torrent_id)
+            return
+        await self._call(
+            "POST",
+            f"/torrents/selectFiles/{torrent_id}",
+            data={"files": ",".join(ids)},
+        )
+
     async def status(self, torrent_id: str) -> DebridStatus:
         info = await self._call("GET", f"/torrents/info/{torrent_id}")
         if not isinstance(info, dict):
@@ -108,6 +158,20 @@ class RealDebrid(DebridProvider):
             files=files,
             raw=info,
         )
+
+    async def find_ready(self, info_hash: str) -> DebridStatus | None:
+        torrents = await self._call("GET", "/torrents?limit=5000")
+        if not isinstance(torrents, list):
+            return None
+        wanted = info_hash.lower()
+        for torrent in torrents:
+            if (
+                isinstance(torrent, dict)
+                and str(torrent.get("hash") or "").lower() == wanted
+                and torrent.get("status") == "downloaded"
+            ):
+                return await self.status(str(torrent["id"]))
+        return None
 
     async def unrestrict(self, link: str) -> str:
         result = await self._call("POST", "/unrestrict/link", data={"link": link})

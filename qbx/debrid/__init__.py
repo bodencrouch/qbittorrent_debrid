@@ -1,4 +1,4 @@
-from .base import DebridError, DebridFile, DebridProvider, DebridStatus, TorrentState
+from .base import DebridError, DebridFile, DebridProvider, DebridStatus, TorrentState, WantedFile
 from .manager import DebridManager
 
 __all__ = [
@@ -7,5 +7,6 @@ __all__ = [
     "DebridProvider",
     "DebridStatus",
     "TorrentState",
+    "WantedFile",
     "DebridManager",
 ]

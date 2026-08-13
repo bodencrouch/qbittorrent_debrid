@@ -22,7 +22,7 @@ FastAPI daemon (qbx serve)  ←→  qBittorrent WebAPI
 | **Launcher / tray** | Start or reuse the daemon; open a PyQt6 window with the Control Shell |
 | **Server** | REST + SSE + static UI on loopback (default `127.0.0.1:8484`) |
 | **Interceptor** | Decide which torrents get debrid help; inject webseeds |
-| **Debrid manager** | Real-Debrid / AllDebrid with priority order |
+| **Debrid manager** | Real-Debrid / AllDebrid / Premiumize.me with priority order |
 | **Matcher** | Manual size rematch; optional content-hash placement |
 | **Storage service** | Single-flight content-duplicate scans; hardlink / quarantine reclaim |
 | **Config store** | Encrypted secrets in `~/.config/qbx/config.toml` |
@@ -39,7 +39,7 @@ FastAPI daemon (qbx serve)  ←→  qBittorrent WebAPI
 ## Delivery modes
 
 - **webseed** (default) — inject unrestricted HTTP URLs into the torrent; qBittorrent downloads them.
-- **download** — legacy in-process downloader when a URL is a bad webseed.
+- **download** — in-process downloader, kept as a compatibility fallback when a URL is a bad webseed.
 
 ## Metadata handoff
 

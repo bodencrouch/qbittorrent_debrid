@@ -107,6 +107,17 @@ class AllDebrid(DebridProvider):
             raw=magnet,
         )
 
+    async def find_ready(self, info_hash: str) -> DebridStatus | None:
+        data = await self._call("/v4.1/magnet/status", data={"status": "ready"})
+        magnets = data.get("magnets") or []
+        if isinstance(magnets, dict):
+            magnets = [magnets]
+        wanted = info_hash.lower()
+        for magnet in magnets:
+            if str(magnet.get("hash") or "").lower() == wanted:
+                return await self.status(str(magnet["id"]))
+        return None
+
     async def _files(self, torrent_id: str) -> list[DebridFile]:
         data = await self._call("/v4.1/magnet/files", data={"id[]": torrent_id})
         magnets = data.get("magnets", [])

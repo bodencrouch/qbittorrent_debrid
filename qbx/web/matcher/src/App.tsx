@@ -1,21 +1,20 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Group, Panel, Separator, useDefaultLayout } from "react-resizable-panels"
 import { Toaster } from "@/components/ui/sonner"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
-import { TorrentGrid } from "@/components/TorrentGrid"
+import { TorrentGrid, type TorrentGridHandle } from "@/components/TorrentGrid"
 import { WorkspaceTabs, type TabId } from "@/components/WorkspaceTabs"
 import { LogPanel } from "@/components/LogPanel"
 import { SettingsPanel, type SettingsSection } from "@/components/SettingsPanel"
 import { StoragePanel } from "@/components/StoragePanel"
 import { OverviewPanel } from "@/components/OverviewPanel"
-import { MatcherSurface } from "@/components/MatcherSurface"
 import { CommandBar } from "@/components/CommandBar"
 import { CommandPalette } from "@/components/CommandPalette"
 import { ControlApi, type HealthInfo, type TorrentInfo } from "@/api/backend"
 import type { ActionContext } from "@/lib/actions"
 import { getErrorMessage } from "@/lib/utils"
-import { toast } from "sonner"
+import { toast } from "@/lib/toast"
 import type { ContextMenuAction } from "@/components/TorrentContextMenu"
 
 function readQuery(): { view?: string; hash?: string } {
@@ -28,13 +27,13 @@ function readQuery(): { view?: string; hash?: string } {
 
 type HealthState = "loading" | "online" | "offline" | "partial"
 
-// Shell-level surface. Storage and Matcher are torrent-independent, so they cannot live in
-// * WorkspaceTabs (those require a selected torrent).
-type Surface = "overview" | "torrents" | "storage" | "matcher";
+// Shell-level surface. Storage is torrent-independent, so it cannot live in
+// WorkspaceTabs (those require a selected torrent). Matcher configuration lives
+// only in Settings now, to avoid two out-of-sync copies of the same UI.
+type Surface = "overview" | "torrents" | "storage";
 
 function initialSurface(view?: string): Surface {
   if (view === "storage") return "storage"
-  if (view === "matcher") return "matcher"
   if (view === "torrents" || view === "match" || view === "debrid") return "torrents"
   return "overview"
 }
@@ -65,6 +64,8 @@ export default function App() {
   const [health, setHealth] = useState<HealthInfo | null>(null)
   const [healthEverLoaded, setHealthEverLoaded] = useState(false)
   const [selected, setSelected] = useState<TorrentInfo | null>(null)
+  const [selectedTorrents, setSelectedTorrents] = useState<TorrentInfo[]>([])
+  const gridRef = useRef<TorrentGridHandle>(null)
   const [refreshKey, setRefreshKey] = useState(0)
   const [highlight, setHighlight] = useState<Set<string>>(new Set())
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -162,9 +163,16 @@ export default function App() {
     setSettingsOpen(true)
   }, [])
 
+  const clearSelection = useCallback(() => {
+    setSelectedTorrents([])
+    gridRef.current?.clearSelection()
+  }, [])
+
   const actionCtx: ActionContext = useMemo(
     () => ({
       torrent: selected,
+      torrents: selectedTorrents,
+      onClearSelection: clearSelection,
       health,
       openSettings,
       onNavigate: (tab, torrent) => {
@@ -179,7 +187,7 @@ export default function App() {
       },
       refreshHealth,
     }),
-    [selected, health, openSettings, refreshHealth],
+    [selected, selectedTorrents, clearSelection, health, openSettings, refreshHealth],
   )
 
   const toggleInterceptor = async () => {
@@ -210,7 +218,7 @@ export default function App() {
   const attentionCritical = health?.attention?.critical_count ?? 0
 
   return (
-    <div className="h-screen flex flex-col bg-background text-foreground dark">
+    <div className="h-screen flex flex-col bg-background text-foreground">
       <header className="flex items-center gap-3 border-b border-border px-4 py-2 bg-card/50 shrink-0">
         <h1 className="text-sm font-bold tracking-[0.2em]">QBX</h1>
         <Badge variant={hBadge.variant} className="text-[10px]">
@@ -259,15 +267,6 @@ export default function App() {
             onClick={() => setSurface("storage")}
           >
             Storage
-          </Button>
-          <Button
-            size="sm"
-            variant={surface === "matcher" ? "default" : "outline"}
-            className="h-7 text-xs"
-            aria-current={surface === "matcher" ? "page" : undefined}
-            onClick={() => setSurface("matcher")}
-          >
-            Matcher
           </Button>
         </nav>
         {health?.server_info && (
@@ -349,19 +348,18 @@ export default function App() {
                 onOpenSettings={openSettings}
                 onOpenStorage={() => setSurface("storage")}
                 onOpenTorrents={() => setSurface("torrents")}
-                onOpenMatcher={() => setSurface("matcher")}
                 onRefreshHealth={() => void refreshHealth()}
               />
             ) : surface === "storage" ? (
               <StoragePanel />
-            ) : surface === "matcher" ? (
-              <MatcherSurface health={health} />
             ) : (
             <Group orientation="horizontal" className="h-full" {...horizontalLayout}>
               <Panel id="grid" defaultSize="55" minSize="30">
                 <TorrentGrid
+                  ref={gridRef}
                   selectedHash={selected?.hash || null}
                   onSelect={onSelect}
+                  onSelectionChange={setSelectedTorrents}
                   highlightHashes={highlight}
                   refreshKey={refreshKey}
                   onNavigate={onGridNavigate}

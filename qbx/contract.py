@@ -22,9 +22,6 @@ DOCKER_DATA_HINT = (
     "In Docker, mount one host path to /data in qBittorrent, qbx, and *arr containers "
     "so internal paths match. Example compose volume: - /mnt/user/media:/data"
 )
-DISK_WARN_FREE_RATIO = 0.10
-DISK_HARD_FREE_RATIO = 0.05
-
 
 @dataclass
 class CheckResult:
@@ -204,34 +201,35 @@ def _filesystem_checks(store: ConfigStore) -> list[CheckResult]:
             )
             continue
 
-        try:
-            usage = shutil.disk_usage(path)
-            if usage.total > 0:
-                free_ratio = usage.free / usage.total
-                if free_ratio < DISK_HARD_FREE_RATIO:
-                    checks.append(
-                        CheckResult(
-                            id=f"root_low_disk_space:{raw}",
-                            severity="hard",
-                            title="Root is critically low on disk space",
-                            detail=f"{raw} has {free_ratio * 100:.1f}% free ({usage.free // (1024 * 1024)} MiB).",
-                            remediation="Free space or expand the volume before automation runs.",
-                            settings_section=section,
+        if cfg.contract.disk_space_check_enabled:
+            try:
+                usage = shutil.disk_usage(path)
+                if usage.total > 0:
+                    free_ratio = usage.free / usage.total
+                    if free_ratio < cfg.contract.disk_hard_free_ratio:
+                        checks.append(
+                            CheckResult(
+                                id=f"root_low_disk_space:{raw}",
+                                severity="hard",
+                                title="Root is critically low on disk space",
+                                detail=f"{raw} has {free_ratio * 100:.1f}% free ({usage.free // (1024 * 1024)} MiB).",
+                                remediation="Free space or expand the volume before automation runs.",
+                                settings_section=section,
+                            )
                         )
-                    )
-                elif free_ratio < DISK_WARN_FREE_RATIO:
-                    checks.append(
-                        CheckResult(
-                            id=f"root_low_disk_space:{raw}",
-                            severity="soft",
-                            title="Root is low on disk space",
-                            detail=f"{raw} has {free_ratio * 100:.1f}% free ({usage.free // (1024 * 1024)} MiB).",
-                            remediation="Plan cleanup or expand storage soon.",
-                            settings_section=section,
+                    elif free_ratio < cfg.contract.disk_warn_free_ratio:
+                        checks.append(
+                            CheckResult(
+                                id=f"root_low_disk_space:{raw}",
+                                severity="soft",
+                                title="Root is low on disk space",
+                                detail=f"{raw} has {free_ratio * 100:.1f}% free ({usage.free // (1024 * 1024)} MiB).",
+                                remediation="Plan cleanup or expand storage soon.",
+                                settings_section=section,
+                            )
                         )
-                    )
-        except OSError:
-            pass
+            except OSError:
+                pass
 
     for prot in protected:
         prot_path = _normalize_path(prot)

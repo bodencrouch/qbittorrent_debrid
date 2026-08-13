@@ -17,7 +17,7 @@ import {
   type HealthInfo,
   type TorrentInfo,
 } from "@/api/backend"
-import { toast } from "sonner"
+import { toast } from "@/lib/toast"
 
 interface DebridPanelProps {
   torrent: TorrentInfo

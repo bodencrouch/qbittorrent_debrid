@@ -7,7 +7,7 @@ Get qbx talking to qBittorrent and at least one debrid provider, then open the C
 ## 1. Prerequisites
 
 1. qBittorrent 5.0+ with **WebUI enabled**
-2. A Real-Debrid and/or AllDebrid API key
+2. A Real-Debrid, AllDebrid, and/or Premiumize.me API key
 3. Python 3.10+ and, for source installs, Node 18+ / npm
 4. On Linux desktop: `python3-pyqt6` and `python3-pyqt6-webengine` for the tray
 

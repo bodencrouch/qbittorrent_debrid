@@ -5,12 +5,13 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
 from qbx.config import ConfigStore
 from qbx.log_buffer import LogBuffer, RingBufferHandler
-from qbx.server import create_app
+from qbx.server import _qbt_save_paths, create_app
 
 
 def test_health_includes_recent_events_for_dashboard_hydration(tmp_path):
@@ -230,6 +231,56 @@ def test_soft_config_patch_skips_interceptor_rebind(tmp_path):
         assert client.app.state.qbx.qbt is qbt_before
         assert store.config.desktop.notifications is False
         assert store.config.interceptor.stalled_min_minutes == 45
+
+
+async def test_matcher_config_uses_qbt_login_without_qbx_token(tmp_path):
+    store = ConfigStore(tmp_path)
+    store.update({
+        "configured": True,
+        "server": {"api_token": "control-secret"},
+        "qbt": {"url": "http://127.0.0.1:1"},
+        "interceptor": {"enabled": False, "manage_without_debrid": False},
+    })
+
+    app = create_app(store)
+    route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", "") == "/api/config" and "POST" in getattr(route, "methods", set())
+    )
+    state = SimpleNamespace(
+        store=store,
+        notifier=SimpleNamespace(configure=lambda *args: None),
+    )
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(qbx=state)),
+    )
+
+    await route.endpoint(request, {"matcher": {"folders": ["/downloads"]}})
+
+    assert store.config.matcher.folders == ["/downloads"]
+
+
+async def test_qbt_save_paths_uses_current_webapi_fields():
+    class FakeQbt:
+        async def preferences(self):
+            return {
+                "save_path": "/downloads",
+                "temp_path_enabled": True,
+                "temp_path": "/incomplete",
+            }
+
+        async def categories(self):
+            return {
+                "movies": {"savePath": "/media/movies"},
+                "empty": {"savePath": ""},
+            }
+
+    assert await _qbt_save_paths(FakeQbt()) == [
+        "/downloads",
+        "/incomplete",
+        "/media/movies",
+    ]
 
 
 def test_hard_config_patch_rebinds_qbt(tmp_path):
@@ -1065,3 +1116,335 @@ def test_contract_snooze_rejects_hard_check(tmp_path):
         )
         assert res.status_code == 400
         assert "hard" in res.json()["detail"].lower()
+
+
+async def test_torrent_attention_is_cached_across_rapid_polls(tmp_path):
+    """/api/health is polled every 5-10s by several surfaces at once (shell
+    poll, injected-script menu label, every open tab/window). Each call used
+    to re-fetch and re-scan the full torrent list from qBittorrent on every
+    single call — fine against an empty test instance, but a multi-second
+    round trip against a real library of thousands of torrents, repeated by
+    every concurrent poller. Confirm repeated calls within the TTL window
+    reuse the cached result instead of re-querying qBittorrent.
+    """
+    from qbx.server import AppState, _torrent_attention
+
+    store = ConfigStore(tmp_path)
+    store.update({"configured": True})
+
+    call_count = 0
+
+    class FakeQbt:
+        async def torrents(self, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return [{"hash": "abc123", "name": "test", "state": "stalledDL", "last_activity": 0}]
+
+    state = AppState(
+        store=store,
+        qbt=FakeQbt(),
+        debrid=None,  # type: ignore[arg-type]
+        interceptor=None,  # type: ignore[arg-type]
+        automation=None,  # type: ignore[arg-type]
+        events=None,  # type: ignore[arg-type]
+        logs=None,  # type: ignore[arg-type]
+        boot_id="test",
+    )
+
+    first = await _torrent_attention(state)
+    second = await _torrent_attention(state)
+    assert call_count == 1, "second call within the TTL window must not re-query qBittorrent"
+    assert first == second
+
+    # Force the cache to look stale and confirm it does re-query.
+    state.torrent_attention_checked_at = time.time() - 999
+    await _torrent_attention(state)
+    assert call_count == 2
+
+
+async def test_torrent_attention_surfaces_qbx_paused_failed_torrent(tmp_path):
+    """A torrent qbx paused after a debrid failure reports qBittorrent state
+    'pausedDL', not 'stalledDL' -- invisible to the state-driven stalled
+    check. Confirm the tag-driven check surfaces it instead.
+    """
+    from qbx.server import AppState, _torrent_attention
+
+    store = ConfigStore(tmp_path)
+    store.update({"configured": True})
+    now = time.time()
+
+    class FakeQbt:
+        async def torrents(self, **kwargs):
+            return [
+                {
+                    "hash": "deadbeef",
+                    "name": "Failed Torrent",
+                    "state": "pausedDL",
+                    "tags": "qbx-failed",
+                    "category": "radarr",
+                    "last_activity": now - 7200,
+                }
+            ]
+
+    fake_interceptor = SimpleNamespace(
+        torrent_recovery_state=lambda h: {"retry_count": 2, "post_intercept_escalated": False},
+    )
+    state = AppState(
+        store=store,
+        qbt=FakeQbt(),
+        debrid=None,  # type: ignore[arg-type]
+        interceptor=fake_interceptor,  # type: ignore[arg-type]
+        automation=None,  # type: ignore[arg-type]
+        events=None,  # type: ignore[arg-type]
+        logs=None,  # type: ignore[arg-type]
+        boot_id="test",
+    )
+
+    items = await _torrent_attention(state)
+
+    matches = [i for i in items if i.id.startswith("torrent:qbx_failed:")]
+    assert matches, "qbx-failed torrent paused past the threshold must appear in attention"
+    assert matches[0].primary_action == {"type": "retry_torrent", "hash": "deadbeef"}
+    assert "2x" in matches[0].detail
+
+
+async def test_torrent_attention_includes_last_error_reason(tmp_path):
+    from qbx.server import AppState, _torrent_attention
+
+    store = ConfigStore(tmp_path)
+    store.update({"configured": True})
+    now = time.time()
+
+    class FakeQbt:
+        async def torrents(self, **kwargs):
+            return [
+                {
+                    "hash": "deadbeef",
+                    "name": "Failed Torrent",
+                    "state": "pausedDL",
+                    "tags": "qbx-failed",
+                    "category": "radarr",
+                    "last_activity": now - 7200,
+                }
+            ]
+
+    fake_interceptor = SimpleNamespace(
+        torrent_recovery_state=lambda h: {
+            "retry_count": 1,
+            "last_error_reason": "provider timed out after 3600s",
+        },
+    )
+    state = AppState(
+        store=store,
+        qbt=FakeQbt(),
+        debrid=None,  # type: ignore[arg-type]
+        interceptor=fake_interceptor,  # type: ignore[arg-type]
+        automation=None,  # type: ignore[arg-type]
+        events=None,  # type: ignore[arg-type]
+        logs=None,  # type: ignore[arg-type]
+        boot_id="test",
+    )
+
+    items = await _torrent_attention(state)
+
+    matches = [i for i in items if i.id.startswith("torrent:qbx_failed:")]
+    assert matches and "provider timed out after 3600s" in matches[0].detail
+
+
+async def test_torrent_attention_excludes_local_only_category_by_default(tmp_path):
+    from qbx.server import AppState, _torrent_attention
+
+    store = ConfigStore(tmp_path)
+    store.update({
+        "configured": True,
+        "interceptor": {"local_only_categories": ["manual"]},
+    })
+    now = time.time()
+
+    class FakeQbt:
+        async def torrents(self, **kwargs):
+            return [
+                {
+                    "hash": "deadbeef",
+                    "name": "Failed Torrent",
+                    "state": "pausedDL",
+                    "tags": "qbx-failed",
+                    "category": "manual",
+                    "last_activity": now - 7200,
+                }
+            ]
+
+    fake_interceptor = SimpleNamespace(torrent_recovery_state=lambda h: {})
+    state = AppState(
+        store=store,
+        qbt=FakeQbt(),
+        debrid=None,  # type: ignore[arg-type]
+        interceptor=fake_interceptor,  # type: ignore[arg-type]
+        automation=None,  # type: ignore[arg-type]
+        events=None,  # type: ignore[arg-type]
+        logs=None,  # type: ignore[arg-type]
+        boot_id="test",
+    )
+
+    items = await _torrent_attention(state)
+
+    assert not any(i.id.startswith("torrent:qbx_failed:") for i in items)
+
+
+async def test_torrent_attention_includes_local_only_category_when_opted_in(tmp_path):
+    from qbx.server import AppState, _torrent_attention
+
+    store = ConfigStore(tmp_path)
+    store.update({
+        "configured": True,
+        "interceptor": {
+            "local_only_categories": ["manual"],
+            "attention_include_local_only": True,
+        },
+    })
+    now = time.time()
+
+    class FakeQbt:
+        async def torrents(self, **kwargs):
+            return [
+                {
+                    "hash": "deadbeef",
+                    "name": "Failed Torrent",
+                    "state": "pausedDL",
+                    "tags": "qbx-failed",
+                    "category": "manual",
+                    "last_activity": now - 7200,
+                }
+            ]
+
+    fake_interceptor = SimpleNamespace(torrent_recovery_state=lambda h: {})
+    state = AppState(
+        store=store,
+        qbt=FakeQbt(),
+        debrid=None,  # type: ignore[arg-type]
+        interceptor=fake_interceptor,  # type: ignore[arg-type]
+        automation=None,  # type: ignore[arg-type]
+        events=None,  # type: ignore[arg-type]
+        logs=None,  # type: ignore[arg-type]
+        boot_id="test",
+    )
+
+    items = await _torrent_attention(state)
+
+    assert any(i.id.startswith("torrent:qbx_failed:") for i in items)
+
+
+async def test_torrent_attention_surfaces_matcher_terminal_skip(tmp_path):
+    from qbx.server import AppState, _torrent_attention
+
+    store = ConfigStore(tmp_path)
+    store.update({"configured": True, "matcher": {"placement_terminal_skip_threshold": 3}})
+    now = time.time()
+
+    class FakeQbt:
+        async def torrents(self, **kwargs):
+            return [
+                {
+                    "hash": "deadbeef",
+                    "name": "Unplaced Torrent",
+                    "state": "pausedUP",
+                    "tags": "",
+                    "last_activity": now - 10,
+                }
+            ]
+
+    fake_interceptor = SimpleNamespace(
+        torrent_recovery_state=lambda h: {
+            "placement_skip_streak": 3,
+            "placement_skip_reason": "no matching root",
+        },
+    )
+    state = AppState(
+        store=store,
+        qbt=FakeQbt(),
+        debrid=None,  # type: ignore[arg-type]
+        interceptor=fake_interceptor,  # type: ignore[arg-type]
+        automation=None,  # type: ignore[arg-type]
+        events=None,  # type: ignore[arg-type]
+        logs=None,  # type: ignore[arg-type]
+        boot_id="test",
+    )
+
+    items = await _torrent_attention(state)
+
+    matches = [i for i in items if i.id.startswith("torrent:matcher_failed:")]
+    assert matches and "no matching root" in matches[0].detail
+
+
+async def test_torrent_attention_ignores_matcher_skip_streak_below_threshold(tmp_path):
+    from qbx.server import AppState, _torrent_attention
+
+    store = ConfigStore(tmp_path)
+    store.update({"configured": True, "matcher": {"placement_terminal_skip_threshold": 3}})
+    now = time.time()
+
+    class FakeQbt:
+        async def torrents(self, **kwargs):
+            return [
+                {
+                    "hash": "deadbeef",
+                    "name": "Unplaced Torrent",
+                    "state": "pausedUP",
+                    "tags": "",
+                    "last_activity": now - 10,
+                }
+            ]
+
+    fake_interceptor = SimpleNamespace(
+        torrent_recovery_state=lambda h: {"placement_skip_streak": 1, "placement_skip_reason": "not ready"},
+    )
+    state = AppState(
+        store=store,
+        qbt=FakeQbt(),
+        debrid=None,  # type: ignore[arg-type]
+        interceptor=fake_interceptor,  # type: ignore[arg-type]
+        automation=None,  # type: ignore[arg-type]
+        events=None,  # type: ignore[arg-type]
+        logs=None,  # type: ignore[arg-type]
+        boot_id="test",
+    )
+
+    items = await _torrent_attention(state)
+
+    assert not any(i.id.startswith("torrent:matcher_failed:") for i in items)
+
+
+async def test_torrent_attention_ignores_recently_paused_qbx_torrent(tmp_path):
+    from qbx.server import AppState, _torrent_attention
+
+    store = ConfigStore(tmp_path)
+    store.update({"configured": True})
+    now = time.time()
+
+    class FakeQbt:
+        async def torrents(self, **kwargs):
+            return [
+                {
+                    "hash": "deadbeef",
+                    "name": "Failed Torrent",
+                    "state": "pausedDL",
+                    "tags": "qbx-failed",
+                    "last_activity": now - 10,  # just paused, well under threshold
+                }
+            ]
+
+    fake_interceptor = SimpleNamespace(torrent_recovery_state=lambda h: {})
+    state = AppState(
+        store=store,
+        qbt=FakeQbt(),
+        debrid=None,  # type: ignore[arg-type]
+        interceptor=fake_interceptor,  # type: ignore[arg-type]
+        automation=None,  # type: ignore[arg-type]
+        events=None,  # type: ignore[arg-type]
+        logs=None,  # type: ignore[arg-type]
+        boot_id="test",
+    )
+
+    items = await _torrent_attention(state)
+
+    assert not any(i.id.startswith("torrent:qbx_failed:") for i in items)

@@ -131,6 +131,46 @@ def test_contract_low_disk_space_soft_warn(tmp_path, monkeypatch):
     assert any(c.id.startswith("root_low_disk_space:") and c.severity == "soft" for c in report.checks)
 
 
+def test_contract_low_disk_space_check_disableable(tmp_path, monkeypatch):
+    root = tmp_path / "media"
+    root.mkdir()
+    store = _store(
+        tmp_path,
+        matcher={"folders": [str(root)]},
+        contract={"disk_space_check_enabled": False},
+    )
+
+    class Usage:
+        total = 100
+        used = 99
+        free = 1
+
+    monkeypatch.setattr("qbx.contract.shutil.disk_usage", lambda _p: Usage())
+    report = run_checks(store)
+    assert not any(c.id.startswith("root_low_disk_space:") for c in report.checks)
+
+
+def test_contract_disk_space_thresholds_are_configurable(tmp_path, monkeypatch):
+    root = tmp_path / "media"
+    root.mkdir()
+    store = _store(
+        tmp_path,
+        matcher={"folders": [str(root)]},
+        contract={"disk_warn_free_ratio": 0.50, "disk_hard_free_ratio": 0.30},
+    )
+
+    class Usage:
+        total = 100
+        used = 60
+        free = 40
+
+    monkeypatch.setattr("qbx.contract.shutil.disk_usage", lambda _p: Usage())
+    report = run_checks(store)
+    assert any(
+        c.id.startswith("root_low_disk_space:") and c.severity == "soft" for c in report.checks
+    )
+
+
 @pytest.mark.asyncio
 async def test_check_exits_2_on_hard_contract_fail(tmp_path, monkeypatch):
     from qbx.cli import _check

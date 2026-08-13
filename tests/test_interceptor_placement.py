@@ -83,6 +83,54 @@ async def test_placement_pass_survives_errors(tmp_path):
     assert any(e["kind"] == "placement.skip" for e in events.history)
 
 
+async def test_placement_skip_streak_increments_across_passes(tmp_path):
+    store = ConfigStore(tmp_path)
+    store.update({
+        "matcher": {"enabled": True, "auto_placement": True, "folders": [str(tmp_path)]},
+    })
+    qbt = FakeQbt([torrent("t1", "x", state="pausedUP", progress=1.0)])
+
+    async def boom(*_a, **_k):
+        raise RuntimeError("files down")
+
+    qbt.files = boom  # type: ignore[method-assign]
+    interceptor = Interceptor(store, qbt, FakeDebrid(enabled=False), EventBus())
+
+    await interceptor._run_auto_placement(qbt._torrents, reason="test")
+    await interceptor._run_auto_placement(qbt._torrents, reason="test")
+    await interceptor._run_auto_placement(qbt._torrents, reason="test")
+
+    state = interceptor.torrent_recovery_state("t1")
+    assert state["placement_skip_streak"] == 3
+    assert "files_api" in state["placement_skip_reason"]
+
+
+async def test_placement_skip_streak_resets_after_successful_move(tmp_path):
+    staging = tmp_path / "staging"
+    save = tmp_path / "dl"
+    staging.mkdir()
+    save.mkdir()
+    src = staging / "Movie.mkv"
+    src.write_bytes(b"PAYLOAD-XYZ")
+
+    store = ConfigStore(tmp_path / "cfg")
+    store.update({
+        "matcher": {"enabled": True, "auto_placement": True, "folders": [str(staging)]},
+    })
+    t = torrent("abc", "Movie", state="pausedUP", progress=1.0, dlspeed=0)
+    t["save_path"] = str(save)
+    qbt = FakeQbt([t])
+    qbt._files = {"abc": [{"index": 0, "name": "Movie.mkv", "size": len(b"PAYLOAD-XYZ")}]}
+    interceptor = Interceptor(store, qbt, FakeDebrid(enabled=False), EventBus())
+    interceptor._torrent_state["abc"] = {"placement_skip_streak": 2, "placement_skip_reason": "stale"}
+
+    await interceptor._run_auto_placement([t], reason="test")
+
+    state = interceptor.torrent_recovery_state("abc")
+    assert state["placement_skip_streak"] == 0
+    assert state["placement_skip_reason"] == ""
+
+
 async def test_schedule_skips_when_already_running(tmp_path):
     store = ConfigStore(tmp_path)
     store.update(

@@ -21,6 +21,7 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/${APP_NAME}"
 PID_FILE="${RUNTIME_DIR}/server.pid"
 LOG_FILE="${CACHE_DIR}/server.log"
 PORT_FILE="${RUNTIME_DIR}/server.port"
+LOCK_FILE="${RUNTIME_DIR}/server.lock"
 
 mkdir -p "$RUNTIME_DIR" "$CACHE_DIR"
 
@@ -42,7 +43,8 @@ usage() {
 qbx — debrid companion for qBittorrent
 
 Usage:
-  qbx                    Start/reuse the daemon and open the Control Shell panel
+  qbx                    Start/reuse the daemon, open the webui in your browser,
+                         and show the native Control Shell panel
   qbx --no-open          Start/reuse the daemon only
   qbx --status           Print daemon status
   qbx --stop             Stop the managed daemon
@@ -65,14 +67,15 @@ health_ok() {
   local code
   code="$(curl -fsS --max-time 2 "${URL}/api/health" 2>/dev/null || true)"
   [[ -n "$code" ]] || return 1
-  printf '%s' "$code" | grep -q '"ok"[[:space:]]*:[[:space:]]*true' || return 1
-  printf '%s' "$code" | grep -q '"app"[[:space:]]*:[[:space:]]*"qbx"' || return 1
+  grep -q '"app"[[:space:]]*:[[:space:]]*"qbx"' <<<"$code" || return 1
   return 0
 }
 
 port_open() {
   if command -v ss >/dev/null 2>&1; then
-    ss -ltn "sport = :${PORT}" 2>/dev/null | grep -q LISTEN
+    local sockets
+    sockets="$(ss -ltn "sport = :${PORT}" 2>/dev/null || true)"
+    grep -q LISTEN <<<"$sockets"
   else
     curl -fsS --max-time 1 "http://${HOST}:${PORT}/" >/dev/null 2>&1
   fi
@@ -113,17 +116,34 @@ is_running() {
 }
 
 start_server() {
-  local cli
-  choose_port
-  if health_ok; then
-    return 0
+  local cli _
+  exec 9>"$LOCK_FILE"
+  flock -w 30 9
+  if [[ -f "$PORT_FILE" ]]; then
+    set_port "$(cat "$PORT_FILE" 2>/dev/null || echo "$BASE_PORT")"
   fi
-  if is_running && health_ok; then
+  if is_running && port_open; then
+    flock -u 9
+    exec 9>&-
     return 0
   fi
   if is_running; then
+    for _ in $(seq 1 60); do
+      if health_ok || port_open; then
+        flock -u 9
+        exec 9>&-
+        return 0
+      fi
+      sleep 0.5
+    done
     kill "$(cat "$PID_FILE")" 2>/dev/null || true
     rm -f "$PID_FILE"
+  fi
+  choose_port
+  if health_ok; then
+    flock -u 9
+    exec 9>&-
+    return 0
   fi
 
   cli="$(qbx_cli)"
@@ -139,19 +159,26 @@ start_server() {
   )
   echo "$PORT" > "$PORT_FILE"
 
-  local _
   for _ in $(seq 1 100); do
-    if health_ok; then
+    if health_ok || port_open; then
+      flock -u 9
+      exec 9>&-
       return 0
     fi
     sleep 0.1
   done
 
-  echo "qbx daemon did not become healthy. Log: $LOG_FILE" >&2
+  if grep -q "not configured yet\|Run.*setup" "$LOG_FILE" 2>/dev/null; then
+    echo "qbx is not configured yet. Run \`qbx setup\` first." >&2
+  else
+    echo "qbx daemon did not become healthy. Log: $LOG_FILE" >&2
+  fi
   if is_running; then
     kill "$(cat "$PID_FILE")" 2>/dev/null || true
     rm -f "$PID_FILE"
   fi
+  flock -u 9
+  exec 9>&-
   return 1
 }
 
@@ -169,6 +196,26 @@ stop_server() {
     fi
     echo "qbx daemon is not running."
   fi
+}
+
+open_url() {
+  if [[ -z "${URL:-}" ]]; then
+    return 1
+  fi
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$URL" >/dev/null 2>&1 &
+    return 0
+  fi
+  if command -v kde-open5 >/dev/null 2>&1; then
+    kde-open5 "$URL" >/dev/null 2>&1 &
+    return 0
+  fi
+  if command -v kde-open >/dev/null 2>&1; then
+    kde-open "$URL" >/dev/null 2>&1 &
+    return 0
+  fi
+  python3 -c "import webbrowser, urllib.request; urllib.request.urlopen('${URL}')" >/dev/null 2>&1 &
+  return 0
 }
 
 print_version() {
@@ -199,6 +246,13 @@ case "${1:-}" in
     print_version
     ;;
   --status)
+    if [[ -f "$PORT_FILE" ]]; then
+      set_port "$(cat "$PORT_FILE" 2>/dev/null || echo "$BASE_PORT")"
+    fi
+    if is_running && port_open; then
+      echo "qbx is running at $URL"
+      exit 0
+    fi
     choose_port >/dev/null 2>&1 || true
     if health_ok; then
       echo "qbx is running at $URL"
@@ -223,7 +277,11 @@ case "${1:-}" in
     echo "$URL"
     ;;
   "")
-    start_server >/dev/null
+    if ! start_server >/dev/null; then
+      echo "qbx did not start. Check logs at $LOG_FILE" >&2
+      exit 2
+    fi
+    open_url
     exec "$APP_DIR/bin/qbx-tray" --panel
     ;;
   *)

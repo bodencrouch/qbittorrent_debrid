@@ -119,9 +119,54 @@ def notify_status(root: str, client: QbxClient) -> None:
 
 def run_tray_app(show_window_on_start: bool = False) -> int:
     from PyQt6.QtCore import Qt, QTimer, QUrl
-    from PyQt6.QtGui import QCloseEvent, QIcon
+    from PyQt6.QtGui import QCloseEvent, QDesktopServices, QIcon
+    from PyQt6.QtWebEngineCore import QWebEnginePage
     from PyQt6.QtWebEngineWidgets import QWebEngineView
     from PyQt6.QtWidgets import QApplication, QMainWindow, QMenu, QSystemTrayIcon
+
+    LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+    class ShellPage(QWebEnginePage):
+        """Keeps qbx navigation in-window and hands external links to the browser."""
+
+        def acceptNavigationRequest(self, url, nav_type, is_main_frame):  # noqa: N802
+            if (
+                nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked
+                and url.host() not in LOCAL_HOSTS
+            ):
+                QDesktopServices.openUrl(url)
+                return False
+            return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+
+    class ShellView(QWebEngineView):
+        """QWebEngineView that honours window.open / target=_blank.
+
+        QtWebEngine's default createWindow() returns None, which makes every
+        window.open() and target="_blank" a silent no-op. That is why the
+        injected "Open qbx" button appeared dead, and why qBittorrent's own
+        Help links did nothing. Same-origin popups load in this view; external
+        ones go to the desktop browser.
+        """
+
+        def __init__(self, parent=None) -> None:
+            super().__init__(parent)
+            self._popup: QWebEngineView | None = None
+
+        def createWindow(self, _type):  # noqa: N802
+            # Hold a reference: an unparented view is garbage-collected
+            # mid-navigation and the URL never arrives.
+            self._popup = QWebEngineView()
+            self._popup.urlChanged.connect(self._route_popup)
+            return self._popup
+
+        def _route_popup(self, url: QUrl) -> None:
+            if url.host() in LOCAL_HOSTS:
+                self.setUrl(url)
+            else:
+                QDesktopServices.openUrl(url)
+            if self._popup is not None:
+                self._popup.deleteLater()
+                self._popup = None
 
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
 
@@ -149,7 +194,8 @@ def run_tray_app(show_window_on_start: bool = False) -> int:
             self.setWindowIcon(QIcon(icon_path))
             self.resize(WINDOW_WIDTH, WINDOW_HEIGHT)
 
-            self._view = QWebEngineView(self)
+            self._view = ShellView(self)
+            self._view.setPage(ShellPage(self._view))
             self.setCentralWidget(self._view)
 
         def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
@@ -204,7 +250,10 @@ def run_tray_app(show_window_on_start: bool = False) -> int:
         if window.isVisible():
             hide_window()
         else:
-            show_window()
+            # The merged WebUI (qBittorrent + the embedded qbx tab) is now the
+            # primary surface; the standalone Control Shell stays one click
+            # away in the tray menu for anyone who prefers it.
+            show_qbt()
 
     def refresh_tooltip() -> None:
         try:
@@ -234,7 +283,7 @@ def run_tray_app(show_window_on_start: bool = False) -> int:
     tray.activated.connect(on_tray_activated)
 
     def on_sigusr1(_signum: int, _frame: object) -> None:
-        show_window()
+        show_qbt()
 
     signal.signal(signal.SIGUSR1, on_sigusr1)
 
@@ -246,7 +295,7 @@ def run_tray_app(show_window_on_start: bool = False) -> int:
     refresh_tooltip()
 
     if show_window_on_start:
-        show_window()
+        show_qbt()
 
     print(
         "qbx tray started (PyQt6 native shell). "

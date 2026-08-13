@@ -5,12 +5,16 @@
 
 import { ControlApi, QBitService, StorageService, type HealthInfo, type TorrentInfo } from "@/api/backend"
 import { uiLog } from "@/lib/ui-log"
+import { openHostUrl } from "@/lib/host"
 
 export type ActionGroup = "Daemon" | "Torrent" | "Nav" | "Settings" | "Storage"
 
 export type ActionContext = {
   torrent: TorrentInfo | null
   health: HealthInfo | null
+  /** Full multi-selection when more than one torrent is selected in the grid. */
+  torrents?: TorrentInfo[]
+  onClearSelection?: () => void
   /** Open Settings to a section id (connection, providers, …). */
   openSettings?: (section?: string) => void
   onNavigate?: (tab: "overview" | "match" | "debrid", torrent: TorrentInfo) => void
@@ -201,7 +205,7 @@ export const APP_ACTIONS: AppAction[] = [
     run(ctx) {
       const hash = ctx.torrent?.hash
       uiLog("ui.open_webui", hash ? `Open WebUI: ${ctx.torrent!.name}` : "Open WebUI")
-      window.open(hash ? `/qbt/#/transfer|${hash}` : "/qbt/", "_blank", "noopener,noreferrer")
+      openHostUrl(hash ? `/qbt/#/transfer|${hash}` : "/qbt/")
     },
   },
   {

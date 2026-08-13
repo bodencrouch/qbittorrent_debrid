@@ -5,44 +5,30 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Plus, Trash2, Edit2, Check, X, Loader2 } from "lucide-react";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast"
 import { MatcherService, QbtServiceExt, type MatcherRule } from "@/api/backend";
-import { ControlApi } from "@/api/backend";
-import type { HealthInfo } from "@/api/backend";
 
-interface MatcherSurfaceProps {
-  health?: HealthInfo | null;
-}
-
-export function MatcherSurface({ health }: MatcherSurfaceProps) {
+export function MatcherRulesPanel() {
   const [rules, setRules] = useState<MatcherRule[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [categories, setCategories] = useState<string[]>([]);
   const [savePaths, setSavePaths] = useState<string[]>([]);
   const [editingRule, setEditingRule] = useState<MatcherRule | null>(null);
-  const [globalEnabled, setGlobalEnabled] = useState(false);
-  const [autoPlacement, setAutoPlacement] = useState(false);
-  const [intervalMinutes, setIntervalMinutes] = useState(60);
 
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const [rulesRes, cats, paths, config] = await Promise.all([
+      const [rulesRes, cats, paths] = await Promise.all([
         MatcherService.GetRules(),
         QbtServiceExt.GetCategories(),
         QbtServiceExt.GetSavePaths(),
-        ControlApi.getConfig(),
       ]);
       setRules(rulesRes);
       setCategories(cats);
       setSavePaths(paths);
-      const matcherConfig = config.matcher || {};
-      setGlobalEnabled(matcherConfig.enabled !== false);
-      setAutoPlacement(matcherConfig.auto_placement !== true);
-      setIntervalMinutes(matcherConfig.interval_minutes || 60);
     } catch (err) {
-      toast.error(`Failed to load matcher data: ${err}`);
+      toast.error(`Failed to load matcher rules: ${err}`);
     } finally {
       setLoading(false);
     }
@@ -65,17 +51,9 @@ export function MatcherSurface({ health }: MatcherSurfaceProps) {
     setSaving(true);
     try {
       const existingRules = rules.filter((r) => r.name !== rule.name);
-      if (editingRule) {
-        // Update existing
-        const updatedRules = [...existingRules, rule].sort((a, b) => a.priority - b.priority);
-        await MatcherService.UpdateRules(updatedRules);
-        setRules(updatedRules);
-      } else {
-        // Add new
-        const updatedRules = [...rules, rule].sort((a, b) => a.priority - b.priority);
-        await MatcherService.UpdateRules(updatedRules);
-        setRules(updatedRules);
-      }
+      const updatedRules = [...existingRules, rule].sort((a, b) => a.priority - b.priority);
+      await MatcherService.UpdateRules(updatedRules);
+      setRules(updatedRules);
       setEditingRule(null);
       toast.success(`Rule ${rule.name} saved`);
     } catch (err) {
@@ -100,24 +78,6 @@ export function MatcherSurface({ health }: MatcherSurfaceProps) {
     }
   };
 
-  const saveGlobalSettings = async () => {
-    setSaving(true);
-    try {
-      await ControlApi.updateConfig({
-        matcher: {
-          enabled: globalEnabled,
-          auto_placement: autoPlacement,
-          interval_minutes: intervalMinutes,
-        },
-      });
-      toast.success("Global matcher settings saved");
-    } catch (err) {
-      toast.error(`Failed to save global settings: ${err}`);
-    } finally {
-      setSaving(false);
-    }
-  };
-
   const emptyRule: MatcherRule = {
     name: "",
     enabled: true,
@@ -133,74 +93,14 @@ export function MatcherSurface({ health }: MatcherSurfaceProps) {
 
   if (loading) {
     return (
-      <div className="h-full flex items-center justify-center">
-        <Loader2 className="h-8 w-8 animate-spin" />
+      <div className="flex items-center justify-center py-8">
+        <Loader2 className="h-6 w-6 animate-spin" />
       </div>
     );
   }
 
   return (
-    <div className="h-full flex flex-col p-4 gap-4 overflow-auto">
-      <div className="flex items-center justify-between">
-        <h1 className="text-lg font-semibold">Matcher Configuration</h1>
-        {health?.contract?.status !== "ok" && (
-          <Badge variant="destructive" className="text-xs">
-            Path contract: {health.contract.status}
-          </Badge>
-        )}
-      </div>
-
-      {/* Global Settings */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-sm">Global Matcher Settings</CardTitle>
-          <CardDescription className="text-xs">
-            Enable/disable the matcher and configure default behavior
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex items-center gap-2">
-            <Checkbox
-              id="global-enabled"
-              checked={globalEnabled}
-              onCheckedChange={(v) => setGlobalEnabled(v as boolean)}
-            />
-            <label htmlFor="global-enabled" className="text-sm">
-              Matcher enabled
-            </label>
-          </div>
-          <div className="flex items-center gap-2">
-            <Checkbox
-              id="auto-placement"
-              checked={autoPlacement}
-              onCheckedChange={(v) => setAutoPlacement(v as boolean)}
-            />
-            <label htmlFor="auto-placement" className="text-sm">
-              Auto placement enabled
-            </label>
-          </div>
-          <div className="flex items-center gap-2">
-            <label htmlFor="interval" className="text-sm w-20">
-              Scan interval (minutes)
-            </label>
-            <Input
-              id="interval"
-              type="number"
-              min="1"
-              max="1440"
-              value={intervalMinutes}
-              onChange={(e) => setIntervalMinutes(Number(e.target.value))}
-              className="w-24 text-sm"
-            />
-          </div>
-          <Button size="sm" onClick={saveGlobalSettings} disabled={saving}>
-            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
-            Save Global Settings
-          </Button>
-        </CardContent>
-      </Card>
-
-      {/* Rules List */}
+    <div className="space-y-4">
       <Card>
         <CardHeader className="flex flex-row items-center justify-between">
           <div>
@@ -261,7 +161,6 @@ export function MatcherSurface({ health }: MatcherSurfaceProps) {
         </CardContent>
       </Card>
 
-      {/* QBitTorrent Info */}
       <Card>
         <CardHeader>
           <CardTitle className="text-sm">qBittorrent Reference</CardTitle>
@@ -301,7 +200,6 @@ export function MatcherSurface({ health }: MatcherSurfaceProps) {
         </CardContent>
       </Card>
 
-      {/* Rule Editor Dialog */}
       {editingRule && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center p-4 z-50">
           <Card className="w-full max-w-lg max-h-[80vh] overflow-auto">

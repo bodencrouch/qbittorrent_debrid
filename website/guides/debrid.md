@@ -4,7 +4,7 @@
 
 1. A torrent stalls (or you nudge / intercept it).  
 2. The interceptor checks stall timers, queue frontier, category filters, and private-torrent rules.  
-3. Providers run in priority order (AllDebrid / Real-Debrid).  
+3. Providers run in priority order (AllDebrid / Real-Debrid / Premiumize.me).  
 4. Public HTTP links are injected as **webseeds**; qBittorrent resumes.  
 
 If qBittorrent has no metadata yet, **metadata handoff** can fetch a matching `.torrent` from configured caches first.
@@ -14,7 +14,7 @@ If qBittorrent has no metadata yet, **metadata handoff** can fetch a matching `.
 | Mode | Behavior |
 |------|----------|
 | `webseed` (default) | Inject URLs; client downloads |
-| `download` | Legacy in-process downloader fallback |
+| `download` | In-process downloader (compatibility fallback) |
 
 ## Manual actions
 

@@ -52,6 +52,7 @@ export function LogPanel({ filterHash, onHashClick }: LogPanelProps) {
   const [grep, setGrep] = useState("")
   const [level, setLevel] = useState("")
   const [uiSeq, setUiSeq] = useState(0)
+  const [streamError, setStreamError] = useState<string | null>(null)
   const scrollerRef = useRef<HTMLDivElement>(null)
   const pausedRef = useRef(paused)
   pausedRef.current = paused
@@ -90,9 +91,22 @@ export function LogPanel({ filterHash, onHashClick }: LogPanelProps) {
       })
     }
 
+    // EventSource retries silently and indefinitely by default. A bad/missing
+    // API token closes the connection outright (readyState CLOSED, no further
+    // retry) rather than erroring transiently — that's the case worth telling
+    // the user about, since otherwise the log just stays empty forever with
+    // no visible reason why.
+    const onStreamError = (label: string) => (ev: Event) => {
+      const es = ev.currentTarget as EventSource
+      if (es.readyState === EventSource.CLOSED) {
+        setStreamError(`${label} stream unauthorized or unreachable — check the qbx API token in Settings.`)
+      }
+    }
+
     if (mode === "all" || mode === "events" || mode === "debrid") {
       const es = new EventSource(eventsUrl(0))
       es.onmessage = (ev) => {
+        setStreamError(null)
         try {
           const data = JSON.parse(ev.data) as EventEntry
           push({
@@ -108,12 +122,14 @@ export function LogPanel({ filterHash, onHashClick }: LogPanelProps) {
           /* ignore */
         }
       }
+      es.onerror = onStreamError("Event")
       controllers.push({ abort: () => es.close() })
     }
 
     if (mode === "all" || mode === "server" || mode === "debrid") {
       const es = new EventSource(logsUrl(0, level))
       es.onmessage = (ev) => {
+        setStreamError(null)
         try {
           const data = JSON.parse(ev.data) as LogEntry
           push({
@@ -129,6 +145,7 @@ export function LogPanel({ filterHash, onHashClick }: LogPanelProps) {
           /* ignore */
         }
       }
+      es.onerror = onStreamError("Log")
       controllers.push({ abort: () => es.close() })
     }
 
@@ -225,6 +242,11 @@ export function LogPanel({ filterHash, onHashClick }: LogPanelProps) {
           Clear
         </Button>
       </div>
+      {streamError && (
+        <div className="border-b border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-400">
+          {streamError}
+        </div>
+      )}
       <div ref={scrollerRef} className="flex-1 min-h-0 overflow-auto font-mono text-[11px] leading-5 px-2 py-1">
         {visible.length === 0 ? (
           <div className="text-muted-foreground p-2">

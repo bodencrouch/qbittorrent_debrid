@@ -55,6 +55,16 @@ log = logging.getLogger("qbx.server")
 
 CONTRACT_STALE_SEC = 60
 CONTRACT_NOTIFY_DEBOUNCE_SEC = 60
+# /api/health is polled every 5-10s by several surfaces at once (the shell's
+# own poll, the injected script's menu-label refresh, every open tab/window).
+# Each call used to re-fetch and re-scan the full torrent list from
+# qBittorrent — fine against an empty test instance, but against a real
+# library (thousands of torrents) that is a multi-second round trip repeated
+# by every concurrent poller, which is what made health checks take 2-3s+
+# under real load and contributed to startup timeouts. Cache like the
+# contract check above: short enough to stay fresh, long enough to absorb
+# a burst of simultaneous pollers.
+TORRENT_ATTENTION_STALE_SEC = 5
 
 WEB_DIR = Path(__file__).parent / "web"
 SHELL_DIST = WEB_DIR / "matcher" / "dist"
@@ -78,6 +88,8 @@ class AppState:
     contract_checked_at: float = 0.0
     contract_last_notify_at: float = 0.0
     contract_last_notified_status: str | None = None
+    torrent_attention_cache: list | None = None
+    torrent_attention_checked_at: float = 0.0
 
     def storage_service(self) -> StorageService:
         if self.storage is None:
@@ -161,18 +173,39 @@ async def _attention_for_state(state: AppState) -> dict:
 
 
 async def _torrent_attention(state: AppState) -> list | None:
-    from .attention import _stalled_torrent_items
+    from .attention import _matcher_failed_torrent_items, _qbx_paused_torrent_items, _stalled_torrent_items
+
+    now = time.time()
+    if (now - state.torrent_attention_checked_at) < TORRENT_ATTENTION_STALE_SEC:
+        return state.torrent_attention_cache
 
     try:
         torrents = await state.qbt.torrents(filter="all")
     except Exception:
         log.debug("torrent attention poll failed", exc_info=True)
-        return None
+        return state.torrent_attention_cache
+    state.torrent_attention_checked_at = now
     if not torrents:
+        state.torrent_attention_cache = None
         return None
     cfg = state.store.config.interceptor
     threshold = max(cfg.stalled_min_minutes, 5) * 60
-    return _stalled_torrent_items(torrents, stalled_threshold_sec=threshold)
+    result = _stalled_torrent_items(torrents, stalled_threshold_sec=threshold)
+    result += _qbx_paused_torrent_items(
+        torrents,
+        idle_threshold_sec=threshold,
+        state_lookup=state.interceptor.torrent_recovery_state if state.interceptor else None,
+        local_only_categories=set(cfg.local_only_categories),
+        cache_only_categories=set(cfg.cache_only_categories),
+        include_local_only=cfg.attention_include_local_only,
+    )
+    result += _matcher_failed_torrent_items(
+        torrents,
+        skip_streak_threshold=state.store.config.matcher.placement_terminal_skip_threshold,
+        state_lookup=state.interceptor.torrent_recovery_state if state.interceptor else None,
+    )
+    state.torrent_attention_cache = result
+    return result
 
 
 def _load_snoozed_check_ids(store: ConfigStore) -> set[str]:
@@ -191,6 +224,24 @@ def _check_token(request: Request, supplied: str | None) -> None:
 
 def _require_token(request: Request, x_api_token: str | None = Header(default=None)) -> None:
     _check_token(request, x_api_token)
+
+
+async def _qbt_save_paths(qbt: QbtClient) -> list[str]:
+    prefs = await qbt.preferences()
+    paths = [str(prefs.get("save_path") or "").strip()]
+    if prefs.get("temp_path_enabled"):
+        paths.append(str(prefs.get("temp_path") or "").strip())
+    try:
+        categories = await qbt.categories()
+    except QbtError:
+        categories = {}
+    if isinstance(categories, dict):
+        paths.extend(
+            str(category.get("savePath") or "").strip()
+            for category in categories.values()
+            if isinstance(category, dict)
+        )
+    return sorted({path for path in paths if path})
 
 
 def create_app(store: ConfigStore | None = None) -> FastAPI:
@@ -218,6 +269,15 @@ def create_app(store: ConfigStore | None = None) -> FastAPI:
         qbt_proxy.ensure_proxy_client(app)
         try:
             await qbt.login()
+            if not store.config.matcher.folders:
+                paths = await _qbt_save_paths(qbt)
+                if paths:
+                    store.update({"matcher": {"folders": paths}})
+                    events.emit(
+                        "matcher.paths.acquired",
+                        f"Loaded {len(paths)} search path(s) from qBittorrent",
+                        paths=paths,
+                    )
             report = await run_checks_async(store, qbt)
         except QbtError:
             report = await run_checks_async(store, None)
@@ -281,12 +341,29 @@ def _register_webui(app: FastAPI) -> None:
             raise HTTPException(status_code=404, detail="inject script missing")
         return FileResponse(path, media_type="application/javascript")
 
+    @app.get("/qbx/inject.css")
+    async def qbx_inject_css():
+        path = WEB_DIR / "qbx-inject.css"
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="inject stylesheet missing")
+        return FileResponse(path, media_type="text/css")
+
     @app.get("/qbt/{path:path}")
-    async def qbt_static(path: str):
+    async def qbt_static(request: Request, path: str):
         file = qbt_proxy.resolve_webui_file(path)
         if file is None:
             raise HTTPException(status_code=404, detail="not found")
-        return qbt_proxy.serve_webui_file(file, inject_qbx=True)
+        state: AppState = request.app.state.qbx
+        return qbt_proxy.serve_webui_file(
+            file,
+            inject_qbx=True,
+            bootstrap={
+                "version": __version__,
+                # Lets the injected script prompt for a token instead of
+                # failing with a silent 401.
+                "tokenRequired": bool(state.store.config.server.api_token),
+            },
+        )
 
     @app.get("/matcher")
     @app.get("/matcher/")
@@ -306,6 +383,16 @@ def _register_webui(app: FastAPI) -> None:
         async def shell_index():
             return FileResponse(SHELL_DIST / "index.html")
 
+        @app.get("/embed")
+        async def shell_embed():
+            """Same SPA bundle, rendered as a single chrome-less panel.
+
+            The qBittorrent WebUI frames this (?panel=overview|storage|…) so the
+            React UI keeps its own CSS realm — its Tailwind preflight would
+            otherwise reset the host's MooTools styling.
+            """
+            return FileResponse(SHELL_DIST / "index.html")
+
         @app.get("/favicon.ico")
         async def shell_favicon():
             fav = SHELL_DIST / "favicon.ico"
@@ -313,12 +400,15 @@ def _register_webui(app: FastAPI) -> None:
                 return FileResponse(fav)
             raise HTTPException(status_code=404, detail="not found")
     else:
+        _NO_SHELL = "Control Shell not built. Run: cd qbx/web/matcher && npm install && npm run build"
+
         @app.get("/")
         async def dashboard_fallback():
-            raise HTTPException(
-                status_code=503,
-                detail="Control Shell not built. Run: cd qbx/web/matcher && npm install && npm run build",
-            )
+            raise HTTPException(status_code=503, detail=_NO_SHELL)
+
+        @app.get("/embed")
+        async def embed_fallback():
+            raise HTTPException(status_code=503, detail=_NO_SHELL)
 
 
 def _enrich_torrent(t: dict, interceptor: Interceptor) -> dict:
@@ -533,11 +623,11 @@ def _register_routes(app: FastAPI) -> None:
             "sync": sync,
         }
 
-    @app.get("/api/config", dependencies=[guard])
+    @app.get("/api/config")
     async def get_config(request: Request):
         return request.app.state.qbx.store.redacted()
 
-    @app.post("/api/config", dependencies=[guard])
+    @app.post("/api/config")
     async def update_config(request: Request, patch: dict):
         """Apply a config patch.
 
@@ -545,8 +635,12 @@ def _register_routes(app: FastAPI) -> None:
         persist and refresh the notifier only — no qBittorrent/interceptor tear-down.
         Hard patches (qbt, api_token, providers, anonymity, interceptor.enabled, …)
         keep the historical full rebind path. Unknown top-level keys are hard.
+
+        Settings stay available without a qbx control token. qBittorrent itself
+        authenticates with the configured username and password.
         """
         state: AppState = request.app.state.qbx
+
         soft = config_patch_is_soft(patch)
         cfg = state.store.update(patch)
         state.notifier.configure(cfg.desktop.notifications, cfg.desktop.notify_kinds)
@@ -568,7 +662,7 @@ def _register_routes(app: FastAPI) -> None:
             state.automation.start()
         return state.store.redacted()
 
-    @app.post("/api/qbt/test", dependencies=[guard])
+    @app.post("/api/qbt/test")
     async def qbt_test(request: Request):
         state: AppState = request.app.state.qbx
         try:
@@ -855,21 +949,6 @@ def _register_routes(app: FastAPI) -> None:
             })
         return out
 
-    @app.post("/api/qbt/rename-file", dependencies=[guard])
-    async def qbt_rename_file(request: Request, body: dict):
-        state: AppState = request.app.state.qbx
-        await _require_contract_ok(state)
-        h = (body or {}).get("hash", "").strip()
-        old = (body or {}).get("oldPath", "")
-        new = (body or {}).get("newPath", "")
-        if not h or not old or not new:
-            raise HTTPException(status_code=400, detail="hash, oldPath, newPath required")
-        try:
-            await request.app.state.qbx.qbt.rename_file(h, old, new)
-        except QbtError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return {"ok": True}
-
     @app.post("/api/qbt/file-priority", dependencies=[guard])
     async def qbt_file_priority(request: Request, body: dict):
         state: AppState = request.app.state.qbx
@@ -1050,19 +1129,12 @@ def _register_routes(app: FastAPI) -> None:
         except QbtError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    @app.get("/api/qbt/save-paths", dependencies=[guard])
+    @app.get("/api/qbt/save-paths")
     async def qbt_save_paths(request: Request):
         """Get all qBittorrent save paths."""
         state: AppState = request.app.state.qbx
         try:
-            prefs = await state.qbt.preferences()
-            paths = [prefs.get("default_save_path", "")]
-            alt_paths_str = prefs.get("save_paths", "")
-            if alt_paths_str:
-                paths.extend(alt_paths_str.split('|'))
-            # Filter out empty strings
-            paths = [p for p in paths if p]
-            return {"save_paths": sorted(set(paths))}
+            return {"save_paths": await _qbt_save_paths(state.qbt)}
         except QbtError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
@@ -1070,6 +1142,10 @@ def _register_routes(app: FastAPI) -> None:
     async def qbt_rename_file(request: Request, body: dict):
         """Rename a file in a torrent via qBittorrent WebAPI."""
         state: AppState = request.app.state.qbx
+        # A duplicate registration of this route used to shadow this one; it
+        # carried the contract check while this copy did not, so renames were
+        # silently running with the path contract unenforced.
+        await _require_contract_ok(state)
         try:
             hash_val = body.get("hash", "")
             old_path = body.get("old_path", "")

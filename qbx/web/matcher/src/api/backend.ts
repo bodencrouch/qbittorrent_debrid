@@ -2,6 +2,8 @@
  * HTTP client for the qbx Control Shell (REST + helpers).
  */
 
+import { bridge, isEmbedded } from "@/embed/bridge"
+
 function tokenHeaders(): HeadersInit {
   const token = localStorage.getItem("qbx_token") || "";
   const h: Record<string, string> = { "Content-Type": "application/json" };
@@ -77,10 +79,14 @@ async function api<T>(path: string, opts: RequestInit = {}): Promise<T> {
   }
   if (res.status === 401) {
     // Avoid window.prompt — it blocks the UI and fails in embedded/browser-preview contexts.
-    throw new ApiError(
-      "API token required. Open Settings and enter the token, then Save.",
-      401,
-    );
+    const message = "API token required. Open Settings and enter the token, then Save."
+    // Every 401 flows through this one function, so this is the single choke
+    // point that can make the host offer its own token prompt — regardless of
+    // which component's catch block ends up swallowing the thrown ApiError.
+    if (isEmbedded()) {
+      bridge.toHost({ v: 1, type: "qbx.error", status: 401, message })
+    }
+    throw new ApiError(message, 401)
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -310,12 +316,8 @@ export const QBitService = {
     return api<TorrentFile[]>(`/api/qbt/torrents/${encodeURIComponent(hash)}/files`);
   },
 
-  async RenameFile(hash: string, oldPath: string, newPath: string): Promise<void> {
-    await api("/api/qbt/rename-file", {
-      method: "POST",
-      body: JSON.stringify({ hash, oldPath, newPath }),
-    });
-  },
+  // RenameFile lives on QbtServiceExt. This copy sent camelCase keys the
+  // server never accepted, so every call 400'd.
 
   async SetFilePriority(hash: string, fileIDs: string, priority: number): Promise<void> {
     await api("/api/qbt/file-priority", {

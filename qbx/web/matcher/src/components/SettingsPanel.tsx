@@ -10,11 +10,12 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
-import { ControlApi, IntegrationService, type UpdateCheckResult, type UpdateRelease, type UpdateSource } from "@/api/backend"
+import { ControlApi, IntegrationService, QbtServiceExt, type UpdateCheckResult, type UpdateRelease, type UpdateSource } from "@/api/backend"
 import { IntegrationHealthPanel } from "@/components/IntegrationHealthPanel"
+import { MatcherRulesPanel } from "@/components/MatcherRulesPanel"
 import { cn, getErrorMessage } from "@/lib/utils"
 import { uiLog } from "@/lib/ui-log"
-import { toast } from "sonner"
+import { toast } from "@/lib/toast"
 
 const REDACTED = "********"
 
@@ -26,7 +27,13 @@ export type SettingsSection =
   | "matcher"
   | "application"
 
-type ProviderName = "realdebrid" | "alldebrid"
+type ProviderName = "realdebrid" | "alldebrid" | "premiumize"
+
+const PROVIDER_LABELS: Record<ProviderName, string> = {
+  alldebrid: "AllDebrid",
+  realdebrid: "Real-Debrid",
+  premiumize: "Premiumize",
+}
 
 type ProviderForm = {
   name: ProviderName
@@ -75,9 +82,13 @@ type SettingsForm = {
   matcher_folders: string
   matcher_interval_minutes: number
   matcher_recheck: boolean
+  matcher_require_same_extension: boolean
   content_dupes_roots: string
   content_dupes_protected_roots: string
   // Immediate: Application
+  disk_space_check_enabled: boolean
+  disk_warn_free_percent: number
+  disk_hard_free_percent: number
   update_channel: "stable" | "beta"
   update_source_owner: string
   update_source_repo: string
@@ -99,6 +110,7 @@ function emptyProviders(): ProviderForm[] {
   return [
     { name: "alldebrid", enabled: false, priority: 0, api_key: "", has_secret: false },
     { name: "realdebrid", enabled: false, priority: 1, api_key: "", has_secret: false },
+    { name: "premiumize", enabled: false, priority: 2, api_key: "", has_secret: false },
   ]
 }
 
@@ -123,6 +135,7 @@ function fromConfig(cfg: Record<string, unknown>): SettingsForm {
   })
   const updates = (cfg.updates || {}) as Record<string, unknown>
   const desktop = (cfg.desktop || {}) as Record<string, unknown>
+  const contract = (cfg.contract || {}) as Record<string, unknown>
   const pw = String(qbt.password || "")
   const token = String(server.api_token || "")
   const proxy = String(anonymity.proxy_url || "")
@@ -164,8 +177,12 @@ function fromConfig(cfg: Record<string, unknown>): SettingsForm {
     matcher_folders: folders.join(", "),
     matcher_interval_minutes: Number(matcher.interval_minutes ?? 60),
     matcher_recheck: matcher.recheck !== false,
+    matcher_require_same_extension: matcher.require_same_extension !== false,
     content_dupes_roots: dupeRoots.join(", "),
     content_dupes_protected_roots: protectedRoots.join(", "),
+    disk_space_check_enabled: contract.disk_space_check_enabled !== false,
+    disk_warn_free_percent: Math.round(Number(contract.disk_warn_free_ratio ?? 0.10) * 100),
+    disk_hard_free_percent: Math.round(Number(contract.disk_hard_free_ratio ?? 0.05) * 100),
     update_channel: updates.channel === "beta" ? "beta" : "stable",
     update_source_owner: String(updates.source_owner || "bodencrouch"),
     update_source_repo: String(updates.source_repo || "qbittorrent_debrid"),
@@ -202,9 +219,15 @@ interface SettingsPanelProps {
   onClose: () => void
   onSaved?: () => void
   initialSection?: SettingsSection
+  /**
+   * Render bare, without the Radix Dialog/overlay/portal. Used when a native
+   * host window (a MochaUI window in the embedded qBittorrent WebUI) already
+   * provides the chrome a dialog would otherwise supply.
+   */
+  embedded?: boolean
 }
 
-export function SettingsPanel({ open, onClose, onSaved, initialSection }: SettingsPanelProps) {
+export function SettingsPanel({ open, onClose, onSaved, initialSection, embedded }: SettingsPanelProps) {
   const [section, setSection] = useState<SettingsSection>("connection")
   const [form, setForm] = useState<SettingsForm | null>(null)
   const [baseline, setBaseline] = useState<SettingsForm | null>(null)
@@ -221,6 +244,7 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
   const [releasesError, setReleasesError] = useState("")
   const [selectedTag, setSelectedTag] = useState("")
   const [rowStatus, setRowStatus] = useState<Record<string, ApplyStatus>>({})
+  const [pathsBusy, setPathsBusy] = useState(false)
   const softTimers = useRef<Record<string, number>>({})
 
   useEffect(() => {
@@ -436,6 +460,28 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
     [form, onSaved],
   )
 
+  const acquireMatcherFolders = async () => {
+    if (!form) return
+    setPathsBusy(true)
+    setStatus("mt.folders", "applying")
+    try {
+      const paths = await QbtServiceExt.GetSavePaths()
+      if (paths.length === 0) throw new Error("qBittorrent did not return a save path")
+      const matcherFolders = paths.join(", ")
+      await ControlApi.updateConfig({ matcher: { folders: paths } })
+      setForm((prev) => (prev ? { ...prev, matcher_folders: matcherFolders } : prev))
+      setBaseline((prev) => (prev ? { ...prev, matcher_folders: matcherFolders } : prev))
+      setStatus("mt.folders", "applied")
+      toast.success("Added qBittorrent save paths")
+      onSaved?.()
+    } catch (err) {
+      setStatus("mt.folders", "error")
+      toast.error(getErrorMessage(err))
+    } finally {
+      setPathsBusy(false)
+    }
+  }
+
   const persistSource = useCallback(
     (owner: string, repo: string) => {
       if (!form) return
@@ -596,34 +642,30 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
     )
   }
 
-  return (
-    <Dialog
-      open={open}
-      onOpenChange={(v) => {
-        if (!v) requestClose()
-      }}
-    >
-      <DialogContent
-        className="max-w-4xl w-[min(96vw,56rem)] h-[min(90vh,40rem)] p-0 gap-0 overflow-hidden flex flex-col"
-        onEscapeKeyDown={(e) => {
-          if (dirtySave) {
-            e.preventDefault()
-            requestClose()
-          }
-        }}
-        onInteractOutside={(e) => {
-          if (dirtySave) {
-            e.preventDefault()
-            requestClose()
-          }
-        }}
-      >
-        <DialogHeader className="px-4 pt-4 pb-2 border-b border-border shrink-0 space-y-1">
-          <DialogTitle className="text-sm font-semibold tracking-wide">Settings</DialogTitle>
-          <DialogDescription className="text-[11px]">
-            Connection, Providers, and Anonymity require explicit Save. Interceptor, Matcher, Content Dupes, 
-            and Application prefs apply automatically as you change them. Tray autostart uses its own OS sync.
-          </DialogDescription>
+  // Shared body for both the standalone Dialog and the embedded (bare) render —
+  // the only difference is what supplies the surrounding chrome.
+  const body = (
+    <>
+      <DialogHeader className="px-4 pt-4 pb-2 border-b border-border shrink-0 space-y-1">
+          {/* DialogTitle/Description are Radix primitives that require a Dialog
+              root for their aria-labelledby wiring and throw without one — the
+              embedded render has no Dialog, so it needs plain elements. */}
+          {embedded ? (
+            <h2 className="text-sm font-semibold tracking-wide">Settings</h2>
+          ) : (
+            <DialogTitle className="text-sm font-semibold tracking-wide">Settings</DialogTitle>
+          )}
+          {embedded ? (
+            <p className="text-[11px] text-muted-foreground">
+              Connection, Providers, and Anonymity require explicit Save. Interceptor, Matcher, Content Dupes,
+              and Application prefs apply automatically as you change them. Tray autostart uses its own OS sync.
+            </p>
+          ) : (
+            <DialogDescription className="text-[11px]">
+              Connection, Providers, and Anonymity require explicit Save. Interceptor, Matcher, Content Dupes,
+              and Application prefs apply automatically as you change them. Tray autostart uses its own OS sync.
+            </DialogDescription>
+          )}
         </DialogHeader>
 
         <div className="flex flex-1 min-h-0">
@@ -714,7 +756,7 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
                       <div key={p.name} className="border-b border-border/60 pb-3 space-y-2 last:border-0">
                         <div className="flex items-center justify-between gap-2">
                           <div className="font-medium text-xs">
-                            {p.name === "alldebrid" ? "AllDebrid" : "Real-Debrid"}
+                            {PROVIDER_LABELS[p.name]}
                           </div>
                           <label className="flex items-center gap-1.5 text-[11px]">
                             <input
@@ -1025,31 +1067,44 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
                     }}
                   />
                   <Field label="Search folders (comma-separated)" hint={<StatusHint id="mt.folders" />}>
-                    <Input
-                      className="h-8 text-xs font-mono"
-                      value={form.matcher_folders}
-                      onChange={(e) => setForm({ ...form, matcher_folders: e.target.value })}
-                      onBlur={() => {
-                        const folders = form.matcher_folders
-                          .split(",")
-                          .map((x) => x.trim())
-                          .filter(Boolean)
-                        if (form.matcher_auto_placement && folders.length === 0) {
-                          toast.error("Auto placement requires at least one folder")
-                          return
-                        }
-                        const prev = baseline?.matcher_folders ?? form.matcher_folders
-                        applySoft(
-                          "mt.folders",
-                          { matcher: { folders } },
-                          () => setForm((f) => (f ? { ...f, matcher_folders: prev } : f)),
-                        )
-                      }}
-                      placeholder="/data/media, /mnt/library"
-                    />
+                    <div className="flex gap-2">
+                      <Input
+                        className="h-8 flex-1 text-xs font-mono"
+                        value={form.matcher_folders}
+                        onChange={(e) => setForm({ ...form, matcher_folders: e.target.value })}
+                        onBlur={() => {
+                          const folders = form.matcher_folders
+                            .split(",")
+                            .map((x) => x.trim())
+                            .filter(Boolean)
+                          if (form.matcher_auto_placement && folders.length === 0) {
+                            toast.error("Auto placement requires at least one folder")
+                            return
+                          }
+                          const prev = baseline?.matcher_folders ?? form.matcher_folders
+                          applySoft(
+                            "mt.folders",
+                            { matcher: { folders } },
+                            () => setForm((f) => (f ? { ...f, matcher_folders: prev } : f)),
+                          )
+                        }}
+                        placeholder="/data/media, /mnt/library"
+                      />
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 shrink-0 text-xs"
+                        disabled={pathsBusy}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => void acquireMatcherFolders()}
+                      >
+                        {pathsBusy ? "Acquiring…" : "Acquire from API"}
+                      </Button>
+                    </div>
                     <p className="text-[10px] text-muted-foreground mt-1 leading-relaxed">
-                      Point matcher folders at your library (protected) and download/incomplete areas separately.
-                      In Docker, paths must match what qBittorrent and *arr apps see inside the container.
+                      Include library, download, and incomplete folders.
+                      Docker paths must match what qBittorrent and *arr apps use.
                     </p>
                   </Field>
                   <Field label="Storage scan roots (comma-separated)" hint={<StatusHint id="cd.roots" />}>
@@ -1124,11 +1179,81 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
                       )
                     }}
                   />
+                  <SoftCheck
+                    label="Require same file extension"
+                    checked={form.matcher_require_same_extension}
+                    statusId="mt.require_same_extension"
+                    StatusHint={StatusHint}
+                    onChange={(v) => {
+                      const prev = form.matcher_require_same_extension
+                      setForm({ ...form, matcher_require_same_extension: v })
+                      applySoft(
+                        "mt.require_same_extension",
+                        { matcher: { require_same_extension: v } },
+                        () => setForm((f) => (f ? { ...f, matcher_require_same_extension: prev } : f)),
+                      )
+                    }}
+                  />
                 </SectionBlock>
               )}
 
+              {form && section === "matcher" && <MatcherRulesPanel />}
+
               {form && section === "application" && (
                 <SectionBlock title="Application" contract="Immediate">
+                  <SoftCheck
+                    label="Warn about low disk space on storage roots"
+                    checked={form.disk_space_check_enabled}
+                    statusId="contract.disk_check"
+                    StatusHint={StatusHint}
+                    onChange={(v) => {
+                      const prev = form.disk_space_check_enabled
+                      setForm({ ...form, disk_space_check_enabled: v })
+                      applySoft(
+                        "contract.disk_check",
+                        { contract: { disk_space_check_enabled: v } },
+                        () => setForm((f) => (f ? { ...f, disk_space_check_enabled: prev } : f)),
+                      )
+                    }}
+                  />
+                  {form.disk_space_check_enabled && (
+                    <>
+                      <SoftNumber
+                        label="Warn below (% free)"
+                        value={form.disk_warn_free_percent}
+                        min={0}
+                        max={100}
+                        statusId="contract.disk_warn"
+                        StatusHint={StatusHint}
+                        onCommit={(v) => {
+                          const prev = form.disk_warn_free_percent
+                          setForm({ ...form, disk_warn_free_percent: v })
+                          applySoft(
+                            "contract.disk_warn",
+                            { contract: { disk_warn_free_ratio: v / 100 } },
+                            () => setForm((f) => (f ? { ...f, disk_warn_free_percent: prev } : f)),
+                          )
+                        }}
+                      />
+                      <SoftNumber
+                        label="Critical below (% free)"
+                        value={form.disk_hard_free_percent}
+                        min={0}
+                        max={100}
+                        statusId="contract.disk_hard"
+                        StatusHint={StatusHint}
+                        onCommit={(v) => {
+                          const prev = form.disk_hard_free_percent
+                          setForm({ ...form, disk_hard_free_percent: v })
+                          applySoft(
+                            "contract.disk_hard",
+                            { contract: { disk_hard_free_ratio: v / 100 } },
+                            () => setForm((f) => (f ? { ...f, disk_hard_free_percent: prev } : f)),
+                          )
+                        }}
+                      />
+                    </>
+                  )}
                   <IntegrationHealthPanel onOpenSettings={setSection} />
                   <div className="flex items-center gap-2 mb-1">
                     {version && (
@@ -1361,6 +1486,36 @@ export function SettingsPanel({ open, onClose, onSaved, initialSection }: Settin
             )}
           </div>
         </div>
+    </>
+  )
+
+  if (embedded) {
+    return <div className="h-screen w-full flex flex-col bg-background text-foreground overflow-hidden">{body}</div>
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(v) => {
+        if (!v) requestClose()
+      }}
+    >
+      <DialogContent
+        className="max-w-4xl w-[min(96vw,56rem)] h-[min(90vh,40rem)] p-0 gap-0 overflow-hidden flex flex-col"
+        onEscapeKeyDown={(e) => {
+          if (dirtySave) {
+            e.preventDefault()
+            requestClose()
+          }
+        }}
+        onInteractOutside={(e) => {
+          if (dirtySave) {
+            e.preventDefault()
+            requestClose()
+          }
+        }}
+      >
+        {body}
       </DialogContent>
     </Dialog>
   )
@@ -1373,6 +1528,7 @@ function pickSoftBaseline(form: SettingsForm, patch: Record<string, unknown>): P
   const cd = patch.content_dupes as Record<string, unknown> | undefined
   const up = patch.updates as Record<string, unknown> | undefined
   const desk = patch.desktop as Record<string, unknown> | undefined
+  const contract = patch.contract as Record<string, unknown> | undefined
   if (ix) {
     if ("enabled" in ix) out.interceptor_enabled = form.interceptor_enabled
     if ("delivery_mode" in ix) out.delivery_mode = form.delivery_mode
@@ -1392,6 +1548,7 @@ function pickSoftBaseline(form: SettingsForm, patch: Record<string, unknown>): P
     if ("folders" in mt) out.matcher_folders = form.matcher_folders
     if ("interval_minutes" in mt) out.matcher_interval_minutes = form.matcher_interval_minutes
     if ("recheck" in mt) out.matcher_recheck = form.matcher_recheck
+    if ("require_same_extension" in mt) out.matcher_require_same_extension = form.matcher_require_same_extension
   }
   if (cd) {
     if ("roots" in cd) out.content_dupes_roots = form.content_dupes_roots
@@ -1404,6 +1561,11 @@ function pickSoftBaseline(form: SettingsForm, patch: Record<string, unknown>): P
     if ("check_on_startup" in up) out.update_check_on_startup = form.update_check_on_startup
   }
   if (desk && "notifications" in desk) out.desktop_notifications = form.desktop_notifications
+  if (contract) {
+    if ("disk_space_check_enabled" in contract) out.disk_space_check_enabled = form.disk_space_check_enabled
+    if ("disk_warn_free_ratio" in contract) out.disk_warn_free_percent = form.disk_warn_free_percent
+    if ("disk_hard_free_ratio" in contract) out.disk_hard_free_percent = form.disk_hard_free_percent
+  }
   return out
 }
 

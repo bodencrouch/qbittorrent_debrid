@@ -48,6 +48,7 @@ def main(argv: list[str] | None = None) -> int:
     p_serve.add_argument("--qbt-password", default=None, help="qBittorrent password")
     p_serve.add_argument("--realdebrid-api-key", default=None, help="Real-Debrid API key")
     p_serve.add_argument("--alldebrid-api-key", default=None, help="AllDebrid API key")
+    p_serve.add_argument("--premiumize-api-key", default=None, help="Premiumize.me API key")
     p_serve.add_argument(
         "--realdebrid",
         dest="realdebrid_enabled",
@@ -61,6 +62,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         action=argparse.BooleanOptionalAction,
         help="enable/disable AllDebrid",
+    )
+    p_serve.add_argument(
+        "--premiumize",
+        dest="premiumize_enabled",
+        default=None,
+        action=argparse.BooleanOptionalAction,
+        help="enable/disable Premiumize.me",
     )
     p_serve.add_argument("--proxy-url", default=None, help="HTTP/SOCKS proxy URL for anonymity layer")
     p_serve.add_argument(
@@ -108,8 +116,10 @@ def main(argv: list[str] | None = None) -> int:
             qbt_password=args.qbt_password,
             realdebrid_api_key=args.realdebrid_api_key,
             alldebrid_api_key=args.alldebrid_api_key,
+            premiumize_api_key=args.premiumize_api_key,
             realdebrid_enabled=args.realdebrid_enabled,
             alldebrid_enabled=args.alldebrid_enabled,
+            premiumize_enabled=args.premiumize_enabled,
             proxy_url=args.proxy_url,
             proxy_enabled=args.proxy_enabled,
         ) or None
@@ -162,7 +172,7 @@ def _prompt(label: str, default: str = "") -> str:
 
 def _setup(store: ConfigStore) -> int:
     cfg = store.config
-    print("== qbx setup ==\nConnect qBittorrent, then add Real-Debrid and/or AllDebrid keys.\n")
+    print("== qbx setup ==\nConnect qBittorrent, then add Real-Debrid, AllDebrid, and/or Premiumize.me keys.\n")
 
     print("-- qBittorrent WebUI --")
     url = _prompt("URL", cfg.qbt.url)
@@ -172,6 +182,7 @@ def _setup(store: ConfigStore) -> int:
     print("\n-- Debrid providers --")
     ad_key = getpass.getpass("AllDebrid API key (blank keeps current): ").strip()
     rd_key = getpass.getpass("Real-Debrid API key (blank keeps current): ").strip()
+    pz_key = getpass.getpass("Premiumize.me API key (blank keeps current): ").strip()
 
     print("\n-- Interceptor --")
     category = _prompt("Only intercept this category (blank = all)",
@@ -205,6 +216,14 @@ def _setup(store: ConfigStore) -> int:
         else:
             providers.append({"name": "realdebrid", "api_key": rd_key,
                               "enabled": True, "priority": 1})
+    if pz_key:
+        existing = next((p for p in providers if p["name"] == "premiumize"), None)
+        if existing:
+            existing["api_key"] = pz_key
+            existing["enabled"] = True
+        else:
+            providers.append({"name": "premiumize", "api_key": pz_key,
+                              "enabled": True, "priority": 2})
 
     store.update({
         "configured": True,

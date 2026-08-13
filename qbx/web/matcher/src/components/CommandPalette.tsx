@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/command"
 import { APP_ACTIONS, type ActionContext, type ActionGroup, type AppAction } from "@/lib/actions"
 import { getErrorMessage } from "@/lib/utils"
-import { toast } from "sonner"
+import { toast } from "@/lib/toast"
 
 interface CommandPaletteProps {
   ctx: ActionContext

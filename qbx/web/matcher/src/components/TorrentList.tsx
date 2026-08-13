@@ -15,7 +15,7 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Spinner } from '@/components/ui/spinner'
 import { formatSize, getErrorMessage } from '@/lib/utils'
 import { useCallback, useEffect, useState } from 'react'
-import { toast } from 'sonner'
+import { toast } from "@/lib/toast"
 import { QBitService } from '../../bindings/qbt-file-matcher/backend'
 import type { TorrentInfo } from '@/api/backend'
 

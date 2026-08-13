@@ -147,6 +147,21 @@ class QbtClient:
     async def main_data(self, rid: int = 0) -> dict:
         return (await self._get("/sync/maindata", {"rid": rid})).json()
 
+    async def main_log(self, last_known_id: int = -1) -> list[dict]:
+        data = (
+            await self._get(
+                "/log/main",
+                {
+                    "normal": "true",
+                    "info": "true",
+                    "warning": "true",
+                    "critical": "true",
+                    "last_known_id": last_known_id,
+                },
+            )
+        ).json()
+        return data if isinstance(data, list) else []
+
     async def torrent_properties(self, torrent_hash: str) -> dict:
         return (await self._get("/torrents/properties", {"hash": torrent_hash})).json()
 
@@ -279,6 +294,32 @@ class QbtClient:
 
     async def reannounce(self, hashes: list[str] | str) -> None:
         await self._post("/torrents/reannounce", {"hashes": _join(hashes)})
+
+    async def set_share_limits(
+        self,
+        hashes: list[str] | str,
+        *,
+        ratio_limit: float = -2,
+        seeding_time_limit: int = -2,
+        inactive_seeding_time_limit: int = -2,
+        share_limit_action: str | None = None,
+    ) -> None:
+        """Set per-torrent share limits (-2 = global, -1 = unlimited, >=0 literal).
+
+        ``shareLimitAction`` (e.g. ``Stop``) exists on newer WebAPI versions;
+        it is only sent when the client is recent enough (same >= 2.11 probe
+        as the webseed endpoints). qBittorrent ignores unknown params, so the
+        gate is belt-and-braces for older 5.x builds.
+        """
+        data: dict[str, Any] = {
+            "hashes": _join(hashes),
+            "ratioLimit": ratio_limit,
+            "seedingTimeLimit": seeding_time_limit,
+            "inactiveSeedingTimeLimit": inactive_seeding_time_limit,
+        }
+        if share_limit_action is not None and await self.supports_webseeds():
+            data["shareLimitAction"] = share_limit_action
+        await self._post("/torrents/setShareLimits", data)
 
     async def set_force_start(self, hashes: list[str] | str, value: bool = True) -> None:
         await self._post(
@@ -469,7 +510,7 @@ def _torrent_add_fields(
 
 
 def _unwrap_parse_metadata(data: dict, filename: str) -> dict:
-    """Normalize array-or-legacy filename-keyed parseMetadata responses."""
+    """Normalize parseMetadata responses (array-shaped or older filename-keyed)."""
     if any(k in data for k in ("infohash_v1", "infohash_v2", "hash", "id", "info")):
         return data
     if filename in data and isinstance(data[filename], dict):

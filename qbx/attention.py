@@ -135,6 +135,129 @@ def _stalled_torrent_items(
     return items
 
 
+def _qbx_paused_torrent_items(
+    torrents: list[dict],
+    *,
+    idle_threshold_sec: int = 1800,
+    state_lookup: Any = None,
+    local_only_categories: frozenset[str] | set[str] = frozenset(),
+    cache_only_categories: frozenset[str] | set[str] = frozenset(),
+    include_local_only: bool = False,
+) -> list[AttentionItem]:
+    """Build ``kind: "torrent"`` attention items for torrents qbx itself paused.
+
+    ``_stalled_torrent_items`` only looks at qBittorrent's own
+    ``stalledDL``/``stalledUP`` states. A torrent qbx paused mid-workflow
+    (mid debrid handoff, or after a debrid failure) reports ``pausedDL`` --
+    a state that check never inspects -- so those torrents were previously
+    invisible here even though they're stuck the same way. This inspects
+    qbx's own tags instead of qBittorrent's state to close that gap.
+
+    *state_lookup*, when given, is called with a torrent hash and expected
+    to return the interceptor's per-torrent state dict (for retry-attempt
+    and error-reason detail); when omitted, items are built without it.
+
+    Torrents in *local_only_categories*/*cache_only_categories* are skipped
+    by default, matching W2-2's existing category policy for the
+    state-driven stalled-torrent check -- set *include_local_only* to
+    surface them anyway.
+    """
+    items: list[AttentionItem] = []
+    now = time.time()
+    excluded_categories = set(local_only_categories) | set(cache_only_categories)
+
+    for t in torrents:
+        state_name = str(t.get("state") or "")
+        if not state_name.startswith("paused"):
+            continue
+        tags = {s.strip() for s in (t.get("tags") or "").split(",") if s.strip()}
+        if "qbx-failed" not in tags and "qbx-debrid" not in tags:
+            continue
+        if not include_local_only and str(t.get("category") or "") in excluded_categories:
+            continue
+        tor_hash = t.get("hash", "")
+        name = t.get("name") or tor_hash or "?"
+        last_activity = t.get("last_activity") or 0
+        idle_sec = now - last_activity if last_activity else 0
+        if idle_sec < idle_threshold_sec:
+            continue
+        qbx_state = state_lookup(tor_hash) if state_lookup else {}
+        idle_min = int(idle_sec // 60)
+
+        if "qbx-failed" in tags:
+            attempts = int((qbx_state or {}).get("retry_count") or 0)
+            reason = str((qbx_state or {}).get("last_error_reason") or "").strip()
+            detail = f"Paused {idle_min}m ago after a debrid failure"
+            detail += f": {reason}" if reason else "."
+            detail += f" Retried {attempts}x automatically." if attempts else ""
+            items.append(
+                AttentionItem(
+                    id=f"torrent:qbx_failed:{tor_hash[:8]}",
+                    kind="torrent",
+                    severity="warning",
+                    title=f"Debrid failed: {name[:80]}",
+                    detail=detail,
+                    primary_action={"type": "retry_torrent", "hash": tor_hash},
+                    href="/?view=torrents",
+                )
+            )
+        elif "qbx-debrid" in tags:
+            items.append(
+                AttentionItem(
+                    id=f"torrent:qbx_active_stuck:{tor_hash[:8]}",
+                    kind="torrent",
+                    severity="warning",
+                    title=f"Stuck mid debrid handoff: {name[:80]}",
+                    detail=f"Paused {idle_min}m ago and still tagged qbx-debrid; the handoff may not have completed.",
+                    primary_action={"type": "open_torrents"},
+                    href="/?view=torrents",
+                )
+            )
+
+    return items
+
+
+def _matcher_failed_torrent_items(
+    torrents: list[dict],
+    *,
+    skip_streak_threshold: int = 3,
+    state_lookup: Any = None,
+) -> list[AttentionItem]:
+    """Build ``kind: "torrent"`` attention items for auto-placement (matcher)
+    runs that keep skipping the same torrent -- W2-2's third torrent
+    attention condition. Auto-placement doesn't pause the torrent (unlike
+    the debrid handoff paths), so this doesn't gate on qBittorrent state at
+    all; it only looks at the interceptor's per-torrent skip streak.
+    """
+    if not state_lookup:
+        return []
+    items: list[AttentionItem] = []
+    for t in torrents:
+        tor_hash = t.get("hash", "")
+        if not tor_hash:
+            continue
+        state = state_lookup(tor_hash) or {}
+        streak = int(state.get("placement_skip_streak") or 0)
+        if streak < skip_streak_threshold:
+            continue
+        name = t.get("name") or tor_hash or "?"
+        reason = str(state.get("placement_skip_reason") or "").strip()
+        detail = f"Skipped {streak} auto-placement pass(es) in a row"
+        detail += f": {reason}." if reason else "."
+        items.append(
+            AttentionItem(
+                id=f"torrent:matcher_failed:{tor_hash[:8]}",
+                kind="torrent",
+                severity="warning",
+                title=f"Matcher can't place: {name[:80]}",
+                detail=detail,
+                primary_action={"type": "open_torrents"},
+                href="/?view=torrents",
+            )
+        )
+    return items
+
+
 def build_attention_items(
     *,
     contract: ContractReport | None,

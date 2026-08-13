@@ -150,6 +150,30 @@ def test_provider_env_enabled_and_priority(tmp_path, monkeypatch):
     assert ad.priority == 5
 
 
+def test_provider_env_keys_seed_premiumize(tmp_path, monkeypatch):
+    monkeypatch.setenv("QBX_PREMIUMIZE_API_KEY", "pz-env")
+    store = ConfigStore(tmp_path)
+    names = {p.name: p.api_key for p in store.config.providers}
+    assert names["premiumize"] == "pz-env"
+
+
+def test_apply_provider_upserts_accepts_premiumize():
+    from qbx.config import apply_provider_upserts
+
+    out = apply_provider_upserts(
+        {"providers": []},
+        [{"name": "premiumize", "api_key": "pz-upsert", "enabled": True}],
+    )
+    assert any(p["name"] == "premiumize" and p["api_key"] == "pz-upsert" for p in out["providers"])
+
+
+def test_premiumize_default_priority_is_distinct(tmp_path, monkeypatch):
+    monkeypatch.setenv("QBX_PREMIUMIZE_API_KEY", "pz")
+    store = ConfigStore(tmp_path)
+    pz = next(p for p in store.config.providers if p.name == "premiumize")
+    assert pz.priority == 2
+
+
 def test_cli_overrides_below_toml(tmp_path):
     store = ConfigStore(tmp_path)
     store.update({"anonymity": {"proxy_url": "socks5://webui:1", "enabled": True}})
@@ -167,6 +191,12 @@ def test_cli_overrides_seed_without_toml(tmp_path):
     store = ConfigStore(tmp_path, cli_overrides=cli)
     assert store.config.anonymity.proxy_url == "socks5://cli:9050"
     assert any(p.name == "alldebrid" and p.api_key == "ad-cli" for p in store.config.providers)
+
+
+def test_cli_overrides_seed_premiumize_without_toml(tmp_path):
+    cli = cli_overrides_from_args(premiumize_api_key="pz-cli", premiumize_enabled=True)
+    store = ConfigStore(tmp_path, cli_overrides=cli)
+    assert any(p.name == "premiumize" and p.api_key == "pz-cli" for p in store.config.providers)
 
 
 def test_env_overrides_helper_nested():

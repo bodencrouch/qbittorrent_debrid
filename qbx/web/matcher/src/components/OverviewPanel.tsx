@@ -11,7 +11,6 @@ type OverviewPanelProps = {
   onOpenSettings: (section?: SettingsSection) => void
   onOpenStorage: () => void
   onOpenTorrents: () => void
-  onOpenMatcher?: () => void
   onRefreshHealth: () => void
 }
 
@@ -20,7 +19,6 @@ export function OverviewPanel({
   onOpenSettings,
   onOpenStorage,
   onOpenTorrents,
-  onOpenMatcher,
   onRefreshHealth,
 }: OverviewPanelProps) {
   return (
@@ -30,7 +28,6 @@ export function OverviewPanel({
           onOpenSettings={onOpenSettings}
           onOpenStorage={onOpenStorage}
           onOpenTorrents={onOpenTorrents}
-          onOpenMatcher={onOpenMatcher}
           onRefreshHealth={onRefreshHealth}
         />
         <InterceptorMonitorPanel

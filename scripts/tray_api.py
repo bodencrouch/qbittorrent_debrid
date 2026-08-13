@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import urllib.error
 import urllib.request
@@ -85,8 +86,15 @@ class QbxClient:
                 with urllib.request.urlopen(url, timeout=1.5) as response:
                     payload = json.loads(response.read().decode("utf-8"))
             except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+                try:
+                    with socket.create_connection((self.host, port), timeout=0.2):
+                        self.base_url = f"http://{self.host}:{port}"
+                        self._health = None
+                        return True
+                except OSError:
+                    pass
                 continue
-            if payload.get("ok") and payload.get("app") == "qbx":
+            if payload.get("app") == "qbx":
                 self.base_url = f"http://{self.host}:{port}"
                 self._health = payload
                 return True
@@ -100,6 +108,16 @@ class QbxClient:
         assert self.base_url
         data = None
         headers = {"Accept": "application/json"}
+        # api_token lives encrypted in config.toml, decryptable only via
+        # qbx.security.SecretBox — which needs `cryptography`, a dependency of
+        # the qbx venv, not of this script's system python3. Duplicating that
+        # decryption here would mean two copies of security-sensitive code to
+        # keep in sync (exactly the class of bug this integration was built to
+        # stop repeating). QBX_API_TOKEN is the escape hatch for anyone who has
+        # set a token and needs this client to reach a guarded endpoint.
+        token = os.environ.get("QBX_API_TOKEN")
+        if token:
+            headers["X-API-Token"] = token
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"

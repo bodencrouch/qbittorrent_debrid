@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button"
 import { Spinner } from "@/components/ui/spinner"
 import { ControlApi } from "@/api/backend"
 import { getErrorMessage } from "@/lib/utils"
-import { toast } from "sonner"
+import { toast } from "@/lib/toast"
 
 export const INTERCEPTOR_PRESETS = {
   conservative: {

@@ -35,6 +35,48 @@ class DebridFile:
 
 
 @dataclass
+class WantedFile:
+    """A torrent file qBittorrent still wants (priority > 0, incomplete).
+
+    Used to narrow provider-side selection (Real-Debrid selectFiles) and the
+    returned link set (providers that always fetch everything) to just the
+    files the client actually needs.
+    """
+
+    name: str
+    size: int = 0
+
+
+def _normalize_path(name: str) -> str:
+    return (name or "").replace("\\", "/").lstrip("/").strip().lower()
+
+
+def matches_wanted(name: str, size: int, wanted: list[WantedFile]) -> bool:
+    """Tolerant name+size match of a provider file against wanted files.
+
+    Providers rarely reproduce the torrent's exact relative paths, so the
+    comparison is: exact normalized path, or path suffix, or basename —
+    requiring an exact size match whenever both sides report a size.
+    """
+    path = _normalize_path(name)
+    if not path:
+        return False
+    base = path.rsplit("/", 1)[-1]
+    for w in wanted:
+        w_path = _normalize_path(w.name)
+        if not w_path:
+            continue
+        w_base = w_path.rsplit("/", 1)[-1]
+        if path != w_path and not path.endswith("/" + w_path) and not w_path.endswith("/" + path):
+            if base != w_base:
+                continue
+        if size and w.size and size != w.size:
+            continue
+        return True
+    return False
+
+
+@dataclass
 class DebridStatus:
     provider: str
     torrent_id: str
@@ -112,9 +154,22 @@ class DebridProvider(abc.ABC):
     async def select_all(self, torrent_id: str) -> None:
         """Select every file for download (RD requires this; AD is a no-op)."""
 
+    async def select_files(self, torrent_id: str, wanted: list[WantedFile] | None = None) -> None:
+        """Select which files the provider should fetch.
+
+        Providers that support per-file selection (Real-Debrid) override this
+        to narrow the selection to *wanted*; the default keeps the historical
+        select-everything behavior.
+        """
+        await self.select_all(torrent_id)
+
     @abc.abstractmethod
     async def unrestrict(self, link: str) -> str:
         """Turn a hoster link into a direct, downloadable URL."""
+
+    async def find_ready(self, info_hash: str) -> DebridStatus | None:
+        """Return a ready account torrent for this info hash, if present."""
+        return None
 
     async def delete(self, torrent_id: str) -> None:  # pragma: no cover - optional
         """Remove a torrent from the provider account (best-effort)."""

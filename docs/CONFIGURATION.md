@@ -20,7 +20,7 @@ Secrets in `config.toml` are encrypted at rest.
 | Section | Purpose |
 |---------|---------|
 | `qbt` | WebUI URL, user, password |
-| `providers` | Real-Debrid / AllDebrid keys, enable, priority |
+| `providers` | Real-Debrid / AllDebrid / Premiumize.me keys, enable, priority |
 | `interceptor` | Stall rules, delivery mode, metadata handoff |
 | `matcher` | Size rematch folders; optional auto placement |
 | `content_dupes` | Storage surface roots, protected roots, min size, keeper rule |
@@ -29,6 +29,20 @@ Secrets in `config.toml` are encrypted at rest.
 | `updates` | GitHub owner/repo, channel, check on startup |
 | `desktop` | Notifications, tray autostart preference |
 | `server` | Bind host/port, optional API token |
+
+`interceptor.cache_only_categories` routes torrents in those categories straight to debrid caching with no local download: qbx pauses the torrent, caches it on the debrid provider, then tags it `qbx-cache-done` and leaves it paused **permanently** unless `cache_only_remove_torrent` (default `true`) deletes it once caching finishes. A cache-only torrent sitting paused in qBittorrent is expected, not stuck.
+
+`interceptor.policy_min_interval_seconds` (default `30`) sets the minimum gap between full event-driven policy passes. Sync batches can arrive every few seconds on a busy library. Batches that add or remove torrents still run at once. Manual scans ignore this setting. `0` disables the gap.
+
+`interceptor.webseed_cache_seconds` (default `300`) caches each torrent's webseed URL list for that many seconds. qbx drops the cached entry when it adds or removes webseeds for that torrent. `0` disables the cache.
+
+`interceptor.stall_after_seconds` (default `86400`, one day) gates the debrid offload path. A torrent becomes an offload candidate once a wanted, incomplete file has made no progress for this long. Multi-file torrents track per-file progress in a ledger (`file-stall-ledger.json` in the qbx state dir); single-file torrents use the torrent's `last_activity` from the sync snapshot. Offload order is first-stalled-first, with the queue order breaking ties. `0` disables the gate and keeps only the shorter `stalled_min_minutes` check.
+
+`interceptor.file_stall_sample_budget_per_pass` (default `20`) caps how many stalled multi-file torrents get one `torrents/files` sample per policy pass, oldest-sampled-first. qbx never sweeps the whole library for file progress in one pass.
+
+`interceptor.webseed_validate_budget_per_pass` (default `10`) caps how many torrents get their webseed URLs HEAD-checked when they enter a download state or restart. Dead URLs are removed and re-resolved from debrid. `interceptor.webseed_validate_cooldown_seconds` (default `1800`) skips re-checking the same torrent inside that window. Either value at `0` disables the check.
+
+`interceptor.download_only` (default `true`) keeps qbx torrents from seeding. qbx sets share limits to ratio `0` with the Stop action when it injects webseeds and when a managed torrent completes, and it stops torrents seen seeding. `interceptor.download_only_stop_budget_per_pass` (default `50`) caps how many seeding torrents get stopped per pass.
 
 When `server.api_token` is set, mutating API routes and `/api/attention` require the `X-API-Token` header (save the same value in Control Shell → Settings → Application). `/api/health` stays public for liveness probes and exposes lean attention counts plus `attention_requires_token: true` so the Overview can prompt for a token without looking broken.
 
@@ -41,9 +55,9 @@ Storage **suppress** lists (hidden duplicate groups) are operational state in th
 | `QBX_CONFIG_DIR` | Config directory |
 | `QBX_QBT__URL` | qBittorrent WebUI URL |
 | `QBX_QBT__USERNAME` / `QBX_QBT__PASSWORD` | WebUI login |
-| `QBX_ALLDEBRID_API_KEY` / `QBX_REALDEBRID_API_KEY` | Provider keys |
-| `QBX_ALLDEBRID_ENABLED` / `QBX_REALDEBRID_ENABLED` | On/off |
-| `QBX_ALLDEBRID_PRIORITY` / `QBX_REALDEBRID_PRIORITY` | Lower = tried first |
+| `QBX_ALLDEBRID_API_KEY` / `QBX_REALDEBRID_API_KEY` / `QBX_PREMIUMIZE_API_KEY` | Provider keys |
+| `QBX_ALLDEBRID_ENABLED` / `QBX_REALDEBRID_ENABLED` / `QBX_PREMIUMIZE_ENABLED` | On/off |
+| `QBX_ALLDEBRID_PRIORITY` / `QBX_REALDEBRID_PRIORITY` / `QBX_PREMIUMIZE_PRIORITY` | Lower = tried first |
 | `QBX_ANONYMITY__PROXY_URL` | e.g. `socks5://127.0.0.1:9050` |
 | `QBX_INTERCEPTOR__DELIVERY_MODE` | `webseed` or `download` |
 | `QBX_INTERCEPTOR__STALLED_ONLY` | Default `true` |

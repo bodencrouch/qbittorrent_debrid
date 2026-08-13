@@ -4,7 +4,7 @@ layout: home
 hero:
   name: qbx
   text: Finish stalled torrents with debrid help
-  tagline: A local companion for qBittorrent. When a download stalls, qbx can ask Real-Debrid or AllDebrid for the files and feed public HTTP links back as webseeds — so qBittorrent finishes the job. Ships a Control Shell, optional KDE tray, and careful defaults.
+  tagline: A local companion for qBittorrent. When a download stalls, qbx can ask Real-Debrid, AllDebrid, or Premiumize.me for the files and feed public HTTP links back as webseeds — so qBittorrent finishes the job. Ships a Control Shell, optional KDE tray, and careful defaults.
   image:
     src: /logo.svg
     alt: qbx
@@ -35,7 +35,7 @@ features:
 ---
 
 ::: info What you need first
-qBittorrent **5.0+** with WebUI enabled, Python 3.10+, and a Real-Debrid and/or AllDebrid API key. On Linux desktop, install `python3-pyqt6` + `python3-pyqt6-webengine` for the tray.
+qBittorrent **5.0+** with WebUI enabled, Python 3.10+, and a Real-Debrid, AllDebrid, and/or Premiumize.me API key. On Linux desktop, install `python3-pyqt6` + `python3-pyqt6-webengine` for the tray.
 :::
 
 ## Quick start

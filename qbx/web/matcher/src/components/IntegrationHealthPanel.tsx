@@ -9,7 +9,7 @@ import {
 } from "@/api/backend"
 import type { SettingsSection } from "@/components/SettingsPanel"
 import { getErrorMessage } from "@/lib/utils"
-import { toast } from "sonner"
+import { toast } from "@/lib/toast"
 
 type IntegrationHealthPanelProps = {
   onOpenSettings?: (section?: SettingsSection) => void

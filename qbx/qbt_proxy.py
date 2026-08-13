@@ -15,11 +15,12 @@ Fixes applied for embedding under ``/qbt/``:
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 import time
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import httpx
 from fastapi import Request, Response
@@ -142,19 +143,55 @@ async def proxy_qbt_api(request: Request, upstream_base: str, subpath: str) -> R
     return response
 
 
-def serve_webui_file(path: Path, *, inject_qbx: bool = False) -> Response:
+def _inject_tags(bootstrap: dict | None) -> str:
+    """Stylesheet + bootstrap payload + script, in that order.
+
+    The bootstrap tag lets the injected script know things it cannot discover
+    from the DOM (notably whether an API token is required) without an extra
+    round trip. It is inert JSON, not executable, and carries nothing secret.
+    """
+    version = str((bootstrap or {}).get("version") or "dev")
+    # Cache-bust on version so a stale script never outlives an upgrade.
+    cache = quote(version, safe="")
+    tags = [f'<link rel="stylesheet" href="/qbx/inject.css?v={cache}">']
+    if bootstrap is not None:
+        payload = json.dumps(bootstrap).replace("<", "\\u003c")
+        tags.append(f'<script id="qbx-bootstrap" type="application/json">{payload}</script>')
+    tags.append(f'<script src="/qbx/inject.js?v={cache}" defer></script>')
+    return "\n".join(tags)
+
+
+def serve_webui_file(
+    path: Path,
+    *,
+    inject_qbx: bool = False,
+    bootstrap: dict | None = None,
+) -> Response:
     if path.suffix.lower() in {".html", ".htm", ".js", ".css"}:
         raw = path.read_text(encoding="utf-8", errors="replace")
         processed = _subst(raw)
-        if path.suffix.lower() in {".html", ".htm"} and inject_qbx:
-            inject = (
-                '<script src="/qbx/inject.js" defer></script>\n'
-                "</body>"
-            )
-            if "</body>" in processed:
-                processed = processed.replace("</body>", inject, 1)
-            else:
-                processed = processed + "\n" + inject.replace("</body>", "")
+        if path.suffix.lower() in {".html", ".htm"} and inject_qbx and path.name == "index.html" and "</body>" in processed:
+            # Only ever inject into the top-level document, never into
+            # views/*.html or the popup fragments (addtorrent.html, rename.html,
+            # ...). Those are loaded over XHR or as small standalone iframe
+            # documents and inserted by MochaUI's OWN manual <script>
+            # extraction, which evals every matched script's text content
+            # regardless of `type` — appending our bootstrap
+            # <script type="application/json"> there is not inert, it gets
+            # eval()'d as JS ("Unexpected token ':'") and aborts whatever the
+            # fragment's own inline script was doing.
+            #
+            # A body-tag check alone is not a safe substitute for this: a
+            # fragment can contain the literal substring "</body>" inside a JS
+            # template literal (views/rss.html builds an iframe srcdoc string
+            # that way) with no real <body> anywhere in the file, and matching
+            # on it corrupts that string instead.
+            #
+            # Confirmed via views/transferlist.html: unconditional injection
+            # broke the torrent table itself — window.qBittorrent.TransferList
+            # never got assigned, so its context menu never attached either.
+            tags = _inject_tags(bootstrap)
+            processed = processed.replace("</body>", f"{tags}\n</body>", 1)
         if path.suffix.lower() in {".html", ".htm"}:
             return HTMLResponse(processed)
         return Response(content=processed, media_type=_media_type(path))

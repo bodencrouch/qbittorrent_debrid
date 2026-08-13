@@ -1,5 +1,28 @@
 # Repository guidelines (for people and agents)
 
+## What qbx is for
+
+qbx does two things together, not one:
+
+1. **Routes new torrents through debrid instead of the slow P2P path.** When
+   qBittorrent picks up a torrent that looks like a good debrid candidate,
+   qbx hands the magnet to RealDebrid/AllDebrid and either injects the
+   result as HTTP webseed sources or downloads it directly — usually far
+   faster than waiting out a weak swarm.
+2. **Actively manages the ongoing qBittorrent queue.** qbx doesn't stop
+   watching once a torrent starts downloading. It reannounces stalled
+   torrents, retries failed debrid handoffs on a backoff schedule, refreshes
+   webseed sources that go dead or stop making progress, and escalates
+   genuinely stuck torrents instead of leaving them paused with no way back.
+   The goal is more downloads completed per session, not just "debrid the
+   easy ones and hope the rest sort themselves out."
+
+Every pause qbx performs on a torrent has an automatic path back to
+resumed, debrided-and-done, or clearly-flagged-for-attention — a torrent
+should never sit paused indefinitely with no reason surfaced to the
+operator. Changes that add a new pause path must add a matching recovery
+path in the same change.
+
 qbx is a small Python app. Keep changes focused. Prefer plain names and small modules.
 
 ## Layout

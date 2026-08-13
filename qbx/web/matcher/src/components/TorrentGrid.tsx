@@ -1,11 +1,20 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+} from "react"
 import { useVirtualizer } from "@tanstack/react-virtual"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { formatSize, getErrorMessage } from "@/lib/utils"
 import { ControlApi, type TorrentInfo } from "@/api/backend"
-import { toast } from "sonner"
+import { toast } from "@/lib/toast"
 import {
   TorrentContextMenu,
   type ContextMenuAction,
@@ -57,6 +66,7 @@ const DEBRID_SORT_RANK: Record<string, number> = {
 }
 
 const WIDTH_STORAGE_KEY = "qbx_grid_col_widths"
+const ORDER_STORAGE_KEY = "qbx_grid_col_order"
 const LIMIT_STORAGE_KEY = "qbx_grid_limit"
 const LIMIT_PRESETS = [100, 250, 500, 1000, 2000, 5000, 0] as const
 
@@ -64,6 +74,27 @@ type WidthMap = Record<ColId, number>
 
 function defaultWidths(): WidthMap {
   return Object.fromEntries(COLUMNS.map((c) => [c.id, c.defaultWidth])) as WidthMap
+}
+
+function defaultOrder(): ColId[] {
+  return COLUMNS.map((c) => c.id)
+}
+
+function readStoredOrder(): ColId[] {
+  const base = defaultOrder()
+  try {
+    const raw = localStorage.getItem(ORDER_STORAGE_KEY)
+    if (!raw) return base
+    const parsed = JSON.parse(raw) as unknown
+    if (!Array.isArray(parsed)) return base
+    const known = new Set(base)
+    const ordered = parsed.filter((id): id is ColId => known.has(id as ColId))
+    const missing = base.filter((id) => !ordered.includes(id))
+    const merged = [...ordered, ...missing]
+    return merged.length === base.length ? merged : base
+  } catch {
+    return base
+  }
 }
 
 function readStoredWidths(): WidthMap {
@@ -169,16 +200,18 @@ interface TorrentGridProps {
   refreshKey?: number
   onNavigate?: (action: ContextMenuAction, torrent: TorrentInfo) => void
   onActionDone?: () => void
+  /** Full multi-selection (ctrl/cmd-click, shift-click range), including the single-clicked row. */
+  onSelectionChange?: (torrents: TorrentInfo[]) => void
 }
 
-export function TorrentGrid({
-  selectedHash,
-  onSelect,
-  highlightHashes,
-  refreshKey = 0,
-  onNavigate,
-  onActionDone,
-}: TorrentGridProps) {
+export interface TorrentGridHandle {
+  clearSelection: () => void
+}
+
+export const TorrentGrid = forwardRef<TorrentGridHandle, TorrentGridProps>(function TorrentGrid(
+  { selectedHash, onSelect, highlightHashes, refreshKey = 0, onNavigate, onActionDone, onSelectionChange },
+  ref,
+) {
   const [torrents, setTorrents] = useState<TorrentInfo[]>([])
   const [filter, setFilter] = useState<string>("downloading")
   const [search, setSearch] = useState("")
@@ -189,13 +222,22 @@ export function TorrentGrid({
   const [customOpen, setCustomOpen] = useState(false)
   const [customLimitDraft, setCustomLimitDraft] = useState("")
   const [widths, setWidths] = useState<WidthMap>(() => readStoredWidths())
+  const [order, setOrder] = useState<ColId[]>(() => readStoredOrder())
   const [menu, setMenu] = useState<{ torrent: TorrentInfo; x: number; y: number } | null>(null)
+  const [selectedHashes, setSelectedHashes] = useState<Set<string>>(new Set())
+  const [dragOverCol, setDragOverCol] = useState<ColId | null>(null)
+  const anchorIndexRef = useRef<number | null>(null)
+  const dragColRef = useRef<ColId | null>(null)
   const parentRef = useRef<HTMLDivElement>(null)
   const dragRef = useRef<{
     id: ColId
     startX: number
     startW: number
   } | null>(null)
+
+  useImperativeHandle(ref, () => ({
+    clearSelection: () => setSelectedHashes(new Set()),
+  }))
 
   const setLimitPersistent = useCallback((next: number) => {
     const value = Number.isFinite(next) && next >= 0 ? Math.floor(next) : 500
@@ -215,6 +257,36 @@ export function TorrentGrid({
       /* ignore */
     }
   }, [])
+
+  const persistOrder = useCallback((next: ColId[]) => {
+    setOrder(next)
+    try {
+      localStorage.setItem(ORDER_STORAGE_KEY, JSON.stringify(next))
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
+  const reorderColumns = useCallback(
+    (dragId: ColId, dropId: ColId) => {
+      if (dragId === dropId) return
+      setOrder((prev) => {
+        const from = prev.indexOf(dragId)
+        const to = prev.indexOf(dropId)
+        if (from === -1 || to === -1) return prev
+        const next = [...prev]
+        next.splice(from, 1)
+        next.splice(to, 0, dragId)
+        try {
+          localStorage.setItem(ORDER_STORAGE_KEY, JSON.stringify(next))
+        } catch {
+          /* ignore */
+        }
+        return next
+      })
+    },
+    [],
+  )
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -333,13 +405,50 @@ export function TorrentGrid({
     document.body.style.userSelect = "none"
   }
 
+  const orderedColumns = useMemo(
+    () => order.map((id) => COLUMNS.find((c) => c.id === id)).filter((c): c is ColDef => !!c),
+    [order],
+  )
   const gridTemplate = useMemo(
-    () => COLUMNS.map((c) => `${widths[c.id]}px`).join(" "),
-    [widths],
+    () => orderedColumns.map((c) => `${widths[c.id]}px`).join(" "),
+    [widths, orderedColumns],
   )
   const totalWidth = useMemo(
-    () => COLUMNS.reduce((sum, c) => sum + widths[c.id], 0) + 24,
-    [widths],
+    () => orderedColumns.reduce((sum, c) => sum + widths[c.id], 0) + 24,
+    [widths, orderedColumns],
+  )
+
+  useEffect(() => {
+    if (!onSelectionChange) return
+    if (selectedHashes.size === 0) {
+      onSelectionChange([])
+      return
+    }
+    onSelectionChange(rows.filter((r) => selectedHashes.has(r.hash)))
+  }, [selectedHashes, rows, onSelectionChange])
+
+  const handleRowClick = useCallback(
+    (e: ReactMouseEvent, t: TorrentInfo, index: number) => {
+      if (e.shiftKey && anchorIndexRef.current !== null) {
+        const lo = Math.min(anchorIndexRef.current, index)
+        const hi = Math.max(anchorIndexRef.current, index)
+        const range = rows.slice(lo, hi + 1).map((r) => r.hash)
+        setSelectedHashes((prev) => new Set([...prev, ...range]))
+      } else if (e.metaKey || e.ctrlKey) {
+        setSelectedHashes((prev) => {
+          const next = new Set(prev)
+          if (next.has(t.hash)) next.delete(t.hash)
+          else next.add(t.hash)
+          return next
+        })
+        anchorIndexRef.current = index
+      } else {
+        setSelectedHashes(new Set([t.hash]))
+        anchorIndexRef.current = index
+      }
+      onSelect(t)
+    },
+    [rows, onSelect],
   )
 
   const limitLabel = limit === 0 ? "all" : String(limit)
@@ -471,15 +580,33 @@ export function TorrentGrid({
           size="sm"
           variant="ghost"
           className="h-7 text-xs"
-          title="Reset column widths"
-          onClick={() => persistWidths(defaultWidths())}
+          title="Reset column widths and order"
+          onClick={() => {
+            persistWidths(defaultWidths())
+            persistOrder(defaultOrder())
+          }}
         >
           Reset cols
         </Button>
-        <Button size="sm" variant="ghost" className="h-7 text-xs ml-auto" onClick={load} disabled={loading}>
+        <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={load} disabled={loading}>
           Refresh
         </Button>
-        <span className="text-xs text-muted-foreground" title={`Fetch limit: ${limitLabel}`}>
+        {selectedHashes.size > 0 && (
+          <>
+            <span className="text-xs font-medium text-foreground">
+              {selectedHashes.size} selected
+            </span>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 text-xs"
+              onClick={() => setSelectedHashes(new Set())}
+            >
+              Clear
+            </Button>
+          </>
+        )}
+        <span className="text-xs text-muted-foreground ml-auto" title={`Fetch limit: ${limitLabel}`}>
           {rows.length} shown{cappedHint}
         </span>
       </div>
@@ -489,8 +616,35 @@ export function TorrentGrid({
           className="grid gap-0 px-3 py-1.5 min-w-full"
           style={{ gridTemplateColumns: gridTemplate, width: Math.max(totalWidth, 640) }}
         >
-          {COLUMNS.map((col, idx) => (
-            <div key={col.id} className="relative min-w-0 pr-2">
+          {orderedColumns.map((col, idx) => (
+            <div
+              key={col.id}
+              draggable
+              onDragStart={(e) => {
+                dragColRef.current = col.id
+                e.dataTransfer.effectAllowed = "move"
+              }}
+              onDragOver={(e) => {
+                e.preventDefault()
+                if (dragOverCol !== col.id) setDragOverCol(col.id)
+              }}
+              onDragLeave={() => setDragOverCol((v) => (v === col.id ? null : v))}
+              onDrop={(e) => {
+                e.preventDefault()
+                const dragId = dragColRef.current
+                dragColRef.current = null
+                setDragOverCol(null)
+                if (dragId) reorderColumns(dragId, col.id)
+              }}
+              onDragEnd={() => {
+                dragColRef.current = null
+                setDragOverCol(null)
+              }}
+              title={`Drag to reorder • click to sort by ${col.label}`}
+              className={`relative min-w-0 pr-2 cursor-grab active:cursor-grabbing ${
+                dragOverCol === col.id ? "bg-sky-500/20" : ""
+              }`}
+            >
               <button
                 type="button"
                 className="text-left text-[11px] uppercase tracking-wide text-muted-foreground hover:text-foreground w-full truncate"
@@ -499,11 +653,12 @@ export function TorrentGrid({
                 {col.label}
                 {sortKey === col.sortKey ? (sortAsc ? " ↑" : " ↓") : ""}
               </button>
-              {idx < COLUMNS.length - 1 && (
+              {idx < orderedColumns.length - 1 && (
                 <div
                   role="separator"
                   aria-orientation="vertical"
                   aria-label={`Resize ${col.label}`}
+                  draggable={false}
                   className="absolute right-0 top-0 z-10 h-full w-1.5 cursor-col-resize hover:bg-sky-500/50 active:bg-sky-500/70"
                   onMouseDown={(e) => {
                     e.preventDefault()
@@ -537,16 +692,18 @@ export function TorrentGrid({
             {virtualizer.getVirtualItems().map((item) => {
               const t = rows[item.index]
               const selected = selectedHash === t.hash
+              const multiSelected = selectedHashes.has(t.hash)
               const flash = highlightHashes?.has(t.hash)
               return (
                 <div
                   key={t.hash}
                   role="row"
+                  aria-selected={multiSelected}
                   tabIndex={0}
-                  onClick={() => onSelect(t)}
+                  onClick={(e) => handleRowClick(e, t, item.index)}
                   onContextMenu={(e) => {
                     e.preventDefault()
-                    onSelect(t)
+                    if (!selectedHashes.has(t.hash)) onSelect(t)
                     setMenu({ torrent: t, x: e.clientX, y: e.clientY })
                   }}
                   onKeyDown={(e) => {
@@ -556,7 +713,13 @@ export function TorrentGrid({
                     }
                   }}
                   className={`absolute left-0 grid gap-0 px-3 py-1.5 text-left border-b border-border/40 hover:bg-accent/40 cursor-default outline-none ${
-                    selected ? "bg-accent/60" : flash ? "bg-warning/20" : ""
+                    multiSelected
+                      ? "bg-sky-500/20 border-l-2 border-l-sky-500"
+                      : selected
+                        ? "bg-accent/60"
+                        : flash
+                          ? "bg-warning/20"
+                          : ""
                   }`}
                   style={{
                     height: item.size,
@@ -565,7 +728,7 @@ export function TorrentGrid({
                     width: Math.max(totalWidth, 640),
                   }}
                 >
-                  {COLUMNS.map((col) => (
+                  {orderedColumns.map((col) => (
                     <div key={col.id} className="min-w-0 pr-2 flex items-center overflow-hidden">
                       {renderCell(t, col)}
                     </div>
@@ -589,7 +752,7 @@ export function TorrentGrid({
       />
     </div>
   )
-}
+})
 
 function formatSpeed(bps: number): string {
   if (!bps || bps < 0) return "—"

@@ -14,7 +14,8 @@ from dataclasses import dataclass
 
 from ..config import AppConfig
 from .alldebrid import AllDebrid
-from .base import DebridError, DebridProvider, DebridStatus, TorrentState
+from .base import DebridError, DebridProvider, DebridStatus, TorrentState, WantedFile, matches_wanted
+from .premiumize import Premiumize
 from .realdebrid import RealDebrid
 
 log = logging.getLogger("qbx.debrid")
@@ -22,6 +23,7 @@ log = logging.getLogger("qbx.debrid")
 _REGISTRY = {
     "realdebrid": RealDebrid,
     "alldebrid": AllDebrid,
+    "premiumize": Premiumize,
 }
 
 
@@ -79,11 +81,14 @@ class DebridManager:
         *,
         max_wait_seconds: int = 3600,
         poll_seconds: int = 15,
+        wanted_files: list[WantedFile] | None = None,
     ) -> ReadyFileResult:
         """Add a magnet to the first working provider, poll, and unrestrict.
 
         Tries providers in priority order; on failure falls through to the next.
-        Returns direct download URLs once the provider reports READY.
+        Returns direct download URLs once the provider reports READY. When
+        *wanted_files* is given, providers with per-file selection fetch only
+        those files, and the returned link set is narrowed to them.
         """
         if not self._providers:
             raise DebridError("no debrid providers configured")
@@ -92,12 +97,39 @@ class DebridManager:
         for provider in self._providers:
             try:
                 return await self._resolve_with(
-                    provider, magnet, max_wait_seconds, poll_seconds
+                    provider, magnet, max_wait_seconds, poll_seconds, wanted_files
                 )
             except DebridError as exc:
                 log.warning("provider %s failed to resolve magnet: %s", provider.name, exc)
                 last_error = exc
         raise DebridError(f"all providers failed: {last_error}")
+
+    async def refresh(
+        self,
+        magnet: str,
+        info_hash: str,
+        *,
+        max_wait_seconds: int = 3600,
+        poll_seconds: int = 15,
+        wanted_files: list[WantedFile] | None = None,
+    ) -> ReadyFileResult:
+        """Regenerate URLs from an existing debrid torrent before adding it again."""
+        if not self._providers:
+            raise DebridError("no debrid providers configured")
+
+        for provider in self._providers:
+            try:
+                status = await provider.find_ready(info_hash)
+                if status is not None:
+                    return await self._ready_result(provider, status, wanted_files)
+            except DebridError as exc:
+                log.warning("provider %s existing torrent lookup failed: %s", provider.name, exc)
+        return await self.resolve(
+            magnet,
+            max_wait_seconds=max_wait_seconds,
+            poll_seconds=poll_seconds,
+            wanted_files=wanted_files,
+        )
 
     async def _resolve_with(
         self,
@@ -105,9 +137,10 @@ class DebridManager:
         magnet: str,
         max_wait_seconds: int,
         poll_seconds: int,
+        wanted_files: list[WantedFile] | None = None,
     ) -> ReadyFileResult:
         torrent_id = await provider.add_magnet(magnet)
-        await provider.select_all(torrent_id)
+        await provider.select_files(torrent_id, wanted_files)
 
         waited = 0
         status: DebridStatus | None = None
@@ -136,17 +169,38 @@ class DebridManager:
         if status is None or status.state != TorrentState.READY:
             raise DebridError(f"{provider.name}: timed out after {max_wait_seconds}s")
 
+        return await self._ready_result(provider, status, wanted_files)
+
+    async def _ready_result(
+        self,
+        provider: DebridProvider,
+        status: DebridStatus,
+        wanted_files: list[WantedFile] | None = None,
+    ) -> ReadyFileResult:
+        files = [f for f in status.files if f.link]
+        if wanted_files and files:
+            # Providers without per-file caching (AllDebrid/Premiumize) fetch
+            # everything; narrow the *returned* link set so only wanted files
+            # get unrestricted and webseeded. Fall back to the full set when
+            # matching fails so a naming mismatch never bricks delivery.
+            narrowed = [f for f in files if matches_wanted(f.name, f.size, wanted_files)]
+            if narrowed:
+                files = narrowed
+            else:
+                log.warning(
+                    "%s: wanted-file narrowing matched none of %d file(s); returning all",
+                    provider.name,
+                    len(files),
+                )
         ready: list[ReadyFile] = []
-        for f in status.files:
-            if not f.link:
-                continue
+        for f in files:
             url = await provider.unrestrict(f.link)
             ready.append(ReadyFile(name=f.name, size=f.size, url=url))
 
         if not ready:
             raise DebridError(f"{provider.name}: no downloadable files after unrestrict")
 
-        return ReadyFileResult(provider=provider.name, torrent_id=torrent_id, files=ready)
+        return ReadyFileResult(provider=provider.name, torrent_id=status.torrent_id, files=ready)
 
     async def cache_magnet(
         self,

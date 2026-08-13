@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react"
 import { ControlApi, QBitService, type TorrentInfo } from "@/api/backend"
 import { findAction, type ActionContext } from "@/lib/actions"
 import { getErrorMessage } from "@/lib/utils"
-import { toast } from "sonner"
+import { toast } from "@/lib/toast"
 
 export type ContextMenuAction =
   | "match"

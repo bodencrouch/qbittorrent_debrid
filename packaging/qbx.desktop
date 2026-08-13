@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=qbx
-Comment=Debrid companion for qBittorrent — Control Shell + interceptor
-Exec=qbx --panel
+Comment=Debrid companion for qBittorrent — Control Shell + interceptor + browser
+Exec=qbx
 Icon=qbx
 Terminal=false
 Categories=Network;FileTransfer;

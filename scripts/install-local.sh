@@ -204,8 +204,8 @@ if [[ "$WITH_DESKTOP" -eq 1 ]]; then
 [Desktop Entry]
 Type=Application
 Name=qbx
-Comment=Debrid companion for qBittorrent — Control Shell + interceptor
-Exec=${INSTALL_DIR}/bin/qbx --panel
+Comment=Debrid companion for qBittorrent — Control Shell + interceptor + browser
+Exec=${INSTALL_DIR}/bin/qbx
 Icon=${INSTALL_DIR}/assets/qbx.svg
 Terminal=false
 Categories=Network;FileTransfer;
@@ -215,7 +215,7 @@ Actions=Panel;Tray;Status;Setup;
 
 [Desktop Action Panel]
 Name=Open Control Shell
-Exec=${INSTALL_DIR}/bin/qbx --panel
+Exec=${INSTALL_DIR}/bin/qbx
 Icon=${INSTALL_DIR}/assets/qbx.svg
 
 [Desktop Action Tray]

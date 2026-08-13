@@ -37,7 +37,12 @@ async def test_tagged_duplicate_still_eligible_for_debrid(tmp_path):
     store.update({
         "duplicates": {"enabled": True, "action": "tag"},
         "providers": [{"name": "alldebrid", "api_key": "key"}],
-        "interceptor": {"stalled_min_minutes": 30, "min_stalled_seeds": 0, "reannounce_before_debrid": False},
+        "interceptor": {
+            "stalled_min_minutes": 30,
+            "stall_after_seconds": 3600,
+            "min_stalled_seeds": 0,
+            "reannounce_before_debrid": False,
+        },
     })
     t = torrent("dupe", "Example Movie 720p.mkv", last_activity=now - 7200)
     t["tags"] = TAG_DUPLICATE

@@ -176,8 +176,13 @@ class DesktopNotifier:
             return
         now = time.monotonic()
         with self._lock:
-            last = self._last_sent.get(kind, 0.0)
-            if now - last < self._min_interval:
+            # Sentinel must be None, not 0.0: time.monotonic() counts from boot,
+            # so a 0.0 default makes "never sent" indistinguishable from "just
+            # sent" for the first _min_interval seconds of uptime — which
+            # silently swallowed the first notification of every kind after a
+            # reboot.
+            last = self._last_sent.get(kind)
+            if last is not None and (now - last) < self._min_interval:
                 return
             self._last_sent[kind] = now
         message = str(event.get("message") or "")

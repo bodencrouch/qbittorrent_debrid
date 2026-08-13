@@ -6,7 +6,6 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
 import { Spinner } from '@/components/ui/spinner'
-import { Checkbox } from '@/components/ui/checkbox'
 import {
   Item,
   ItemContent,
@@ -27,11 +26,11 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
-import { toast } from 'sonner'
+import { toast } from "@/lib/toast"
 import { Dialogs } from '@wailsio/runtime'
 import { QBitService, MatcherService } from '../../bindings/qbt-file-matcher/backend'
 import type { TorrentFile, DiskFile, MatchInfo } from '../../bindings/qbt-file-matcher/backend/models'
-import { IntegrationService, type ContractReport } from '@/api/backend'
+import { ControlApi, IntegrationService, QbtServiceExt, type ContractReport } from '@/api/backend'
 import { formatSize, getErrorMessage } from '@/lib/utils'
 import type { TorrentInfo } from '@/api/backend'
 
@@ -66,6 +65,20 @@ export function MatchingPanel({ torrent, onBack, compact }: MatchingPanelProps) 
     IntegrationService.get()
       .then((r) => {
         if (!cancelled) setContract(r)
+      })
+      .catch(() => undefined)
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    ControlApi.getConfig()
+      .then((cfg) => {
+        if (cancelled) return
+        const matcher = (cfg.matcher || {}) as Record<string, unknown>
+        setRequireSameExtension(matcher.require_same_extension !== false)
       })
       .catch(() => undefined)
     return () => {
@@ -220,7 +233,7 @@ export function MatchingPanel({ torrent, onBack, compact }: MatchingPanelProps) 
 
       for (const rename of renames) {
         try {
-          await QBitService.RenameFile(torrent.hash, rename.oldPath, rename.newPath)
+          await QbtServiceExt.RenameFile(torrent.hash, rename.oldPath, rename.newPath)
           successCount++
         } catch (error) {
           errorCount++
@@ -443,16 +456,12 @@ export function MatchingPanel({ torrent, onBack, compact }: MatchingPanelProps) 
               </Button>
             </div>
 
-            <div className="flex items-center gap-2">
-              <Checkbox
-                id="requireExt"
-                checked={requireSameExtension}
-                onCheckedChange={(checked) => setRequireSameExtension(checked === true)}
-              />
-              <label htmlFor="requireExt" className="text-sm text-muted-foreground cursor-pointer">
-                Require same file extension
-              </label>
-            </div>
+            <p className="text-xs text-muted-foreground">
+              {requireSameExtension
+                ? 'Matching requires the same file extension.'
+                : 'Matching allows different file extensions.'}
+              {' '}Change this in Settings → Matcher.
+            </p>
 
             <p className="text-xs text-muted-foreground">
               Scan the download directory (not content directory) where your files are located. 

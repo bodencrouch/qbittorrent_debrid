@@ -11,14 +11,14 @@ import {
 } from "@/api/backend"
 import type { SettingsSection } from "@/components/SettingsPanel"
 import { getErrorMessage } from "@/lib/utils"
-import { toast } from "sonner"
+import { openHostUrl } from "@/lib/host"
+import { toast } from "@/lib/toast"
 
 type AttentionPanelProps = {
   onOpenSettings?: (section?: SettingsSection) => void
   onOpenStorage?: () => void
   onOpenTorrents?: () => void
   onRefreshHealth?: () => void
-  onOpenMatcher?: () => void
 }
 
 function severityBadge(severity: AttentionItem["severity"]) {
@@ -36,7 +36,6 @@ export function AttentionPanel({
   onOpenSettings,
   onOpenStorage,
   onOpenTorrents,
-  onOpenMatcher,
   onRefreshHealth,
 }: AttentionPanelProps) {
   const [payload, setPayload] = useState<AttentionPayload | null>(null)
@@ -87,8 +86,17 @@ export function AttentionPanel({
           await load()
           break
         case "open_qbt":
-          window.open("/qbt/", "_blank")
+          openHostUrl("/qbt/")
           break
+        case "retry_torrent": {
+          const hash = String(action.hash || "")
+          if (!hash) break
+          await ControlApi.retry(hash)
+          toast.success("Retry queued")
+          onRefreshHealth?.()
+          await load()
+          break
+        }
         default:
           break
       }

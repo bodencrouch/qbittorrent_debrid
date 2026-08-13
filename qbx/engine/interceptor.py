@@ -12,12 +12,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from difflib import SequenceMatcher
 
+import httpx
+
+from .. import arr_client
+from ..anonymity import httpx_kwargs
 from ..config import ConfigStore
-from ..debrid import DebridError, DebridManager
+from ..debrid import DebridError, DebridManager, WantedFile
 from ..events import EventBus
 from ..qbt import QbtClient, QbtError
 from ..security import safe_filename
 from .downloader import download_file
+from .file_stall import FileStallLedger
 from .hash_index import HashIndex
 from .ownership import OwnershipRegistry, TorrentRoot
 from .placement import (
@@ -64,6 +69,40 @@ INCOMPLETE_STATES = ACTIVE_DOWNLOAD_STATES | STALL_CANDIDATE_STATES | {
     "missingFiles",
     "error",
 }
+# Seeding states the download-only sweep stops (S8). stoppedUP/pausedUP are
+# already stopped; checkingUP/moving must be left alone.
+SEEDING_STOP_STATES = {"uploading", "stalledUP", "queuedUP", "forcedUP"}
+# A torrent (re)entering one of these download states gets its webseed URLs
+# HEAD-validated (S7), budgeted and deduped per torrent.
+_WEBSEED_VALIDATE_DL_STATES = frozenset({"downloading", "stalledDL", "queuedDL", "forcedDL"})
+_STOPPED_DL_STATES = frozenset({"stoppedDL", "pausedDL"})
+# Per-torrent floor between torrents/files samples for the per-file stall
+# ledger; progress deltas at this granularity are plenty for a 1-day gate.
+_FILE_STALL_SAMPLE_MIN_INTERVAL = 300.0
+# Floor between repeated download-only stops of the same torrent, covering
+# the window before the stop is reflected in the sync snapshot.
+_DOWNLOAD_ONLY_STOP_COOLDOWN = 300.0
+# Reactive log scraping only catches a dead webseed while qBittorrent is
+# still actively retrying it; once a torrent goes fully stalled it stops
+# retrying and the error never reappears in the log. This bounds a periodic
+# proactive HEAD-check of already-added webseed URLs on qbx-managed torrents.
+# interceptor-state.json is a single JSON blob covering every torrent qbx has
+# ever observed; on large libraries it can run into multiple MB. Writing it
+# synchronously on every sync tick (every few seconds) blocks the asyncio
+# event loop — and with it, the HTTP server and qBittorrent WebUI proxy —
+# for however long the json.dumps + disk write takes. Debounce to a floor
+# interval and do the actual write in a worker thread instead.
+_STATE_SAVE_MIN_INTERVAL = 15.0
+_WEBSEED_HEALTHCHECK_COOLDOWN = 600.0
+_WEBSEED_HEALTHCHECK_BATCH = 10
+_WEBSEED_HEALTHCHECK_SAMPLE = 8
+_WEBSEED_HEALTHCHECK_CONCURRENCY = 4
+_WEBSEED_DEAD_STATUS = frozenset({400, 401, 403, 404, 410})
+_URL_SEED_ERROR_RE = re.compile(
+    r'Received error message from URL seed\. Torrent: "(?P<name>.*?)"\. '
+    r'URL: "(?P<url>.*?)"\. Message: "(?P<error>.*?)"'
+)
+_EXPIRED_URL_ERROR_RE = re.compile(r"\b(?:400|401|403|404|410)\b")
 
 
 @dataclass
@@ -262,6 +301,7 @@ class Interceptor:
         self._sync_bootstrapped = False
         self._queueing_enabled: bool | None = None
         self._queueing_source: str = ""
+        self._queueing_checked = False
         self._last_duplicate_at: float = 0
         self._last_placement_at: float = 0
         self._hash_index: HashIndex | None = None
@@ -271,9 +311,18 @@ class Interceptor:
         self._event_batch_id: int = 0
         self._state_path = self._store.dir / "interceptor-state.json"
         self._torrent_state = self._load_state()
+        self._file_stall = FileStallLedger(self._store.dir / "file-stall-ledger.json")
+        self._state_dirty = False
+        self._state_last_saved_at: float = 0.0
+        self._state_save_lock = asyncio.Lock()
+        self._last_stale_webseed_check_at: float = 0.0
+        self._last_event_policy_at: float = 0.0
+        self._webseed_url_cache: dict[str, tuple[float, list[str]]] = {}
         self._policy_pass_id: int = 0
         self._queue_lock = asyncio.Lock()
         self._queue_chain_task: asyncio.Task | None = None
+        self._qbt_log_id = -1
+        self._webseed_recovery_task: asyncio.Task | None = None
 
     # High-volume kinds — never log at INFO (8k libraries freeze the event loop).
     _QUIET_EMIT_KINDS = frozenset({
@@ -286,6 +335,7 @@ class Interceptor:
         "qbt.decision.skip",
         "qbt.decision.candidate",
         "qbt.decision.duplicate",
+        "policy.pass.debounced",
     })
     # Per-torrent decision rows above this library size only update aggregates.
     _REMEMBER_ALL_THRESHOLD = 500
@@ -296,6 +346,9 @@ class Interceptor:
         """Swap in fresh qbt/debrid instances after a config change."""
         self._qbt = qbt
         self._debrid = debrid
+        self._queueing_enabled = None
+        self._queueing_source = ""
+        self._queueing_checked = False
 
     @property
     def running(self) -> bool:
@@ -411,18 +464,58 @@ class Interceptor:
         )
         return {"ok": True, "hash": h, "tag": TAG_SKIP}
 
+    async def _clear_failure_tags(self, hashes: list[str]) -> None:
+        """Remove failed/skip/done tags and re-candidate the given torrents."""
+        if not hashes:
+            return
+        await self._qbt.remove_tags(hashes, f"{TAG_FAILED},{TAG_SKIP},{TAG_DONE}")
+        await self._qbt.add_tags(hashes, TAG_CANDIDATE)
+        for h in hashes:
+            self._sync_local_tags(
+                h,
+                add={TAG_CANDIDATE},
+                remove={TAG_FAILED, TAG_SKIP, TAG_DONE},
+            )
+
+    def torrent_recovery_state(self, torrent_hash: str) -> dict:
+        """Small, read-only view of a torrent's recovery bookkeeping.
+
+        Used by the attention queue to explain *why* a qbx-paused torrent
+        is paused (e.g. retry attempt count) without exposing the full
+        internal state dict.
+        """
+        state = self._torrent_state.get(torrent_hash, {})
+        return {
+            "retry_count": int(state.get("retry_count") or 0),
+            "post_intercept_escalated": bool(state.get("post_intercept_escalated")),
+            "last_error_reason": str(state.get("last_error_reason") or ""),
+            "placement_skip_streak": int(state.get("placement_skip_streak") or 0),
+            "placement_skip_reason": str(state.get("placement_skip_reason") or ""),
+        }
+
+    def _record_placement_outcome(self, torrent_hash: str, *, placed: bool, skip_reason: str) -> None:
+        """Track consecutive auto-placement skips so a torrent that never
+        lands (bad root config, permanently missing files, ...) can be
+        surfaced as a terminal matcher failure rather than silently retried
+        forever. A single move/hardlink, or a pass with nothing to skip,
+        resets the streak -- only *consecutive* skips count.
+        """
+        state = self._torrent_state.setdefault(torrent_hash, {})
+        if placed or not skip_reason:
+            if state.pop("placement_skip_streak", None) is not None:
+                state.pop("placement_skip_reason", None)
+                self._mark_state_dirty()
+            return
+        state["placement_skip_streak"] = int(state.get("placement_skip_streak") or 0) + 1
+        state["placement_skip_reason"] = skip_reason
+        self._mark_state_dirty()
+
     async def retry_torrent(self, torrent_hash: str) -> dict:
         """Clear failure tags and re-candidate a torrent."""
         h = (torrent_hash or "").strip()
         if not h:
             raise ValueError("hash required")
-        await self._qbt.remove_tags(h, f"{TAG_FAILED},{TAG_SKIP},{TAG_DONE}")
-        await self._qbt.add_tags(h, TAG_CANDIDATE)
-        self._sync_local_tags(
-            h,
-            add={TAG_CANDIDATE},
-            remove={TAG_FAILED, TAG_SKIP, TAG_DONE},
-        )
+        await self._clear_failure_tags([h])
         self._emit(
             "intercept.retry",
             f"Retry queued for '{h}' (cleared failed/skip/done, tagged candidate)",
@@ -431,6 +524,164 @@ class Interceptor:
         )
         asyncio.create_task(self.scan_once())
         return {"ok": True, "hash": h, "queued": True}
+
+    async def _recover_failed(
+        self,
+        torrents: list[dict],
+        now: float,
+        *,
+        event_batch_id: int | None = None,
+    ) -> None:
+        """Automatically re-candidate qbx-failed torrents on a backed-off, capped schedule.
+
+        Without this, ``qbx-failed`` is a permanent dead end: ``_candidate_reason``
+        excludes it from every future scan, and the only way out is a manual
+        "Retry failed" click. Attempts are capped so a genuinely broken torrent
+        doesn't retry forever.
+        """
+        cfg = self._store.config.interceptor
+        if not cfg.auto_retry_failed:
+            return
+        eligible: list[tuple[str, dict]] = []
+        for torrent in torrents:
+            h = torrent.get("hash", "")
+            if not h or h in self._inflight:
+                continue
+            tags = {s.strip() for s in (torrent.get("tags") or "").split(",") if s.strip()}
+            if TAG_FAILED not in tags:
+                continue
+            state = self._torrent_state.setdefault(h, {})
+            if int(state.get("retry_count") or 0) >= cfg.max_retry_attempts:
+                continue
+            last_retry = float(state.get("last_retry_at") or 0)
+            if now - last_retry < cfg.retry_backoff_minutes * 60:
+                continue
+            eligible.append((h, torrent))
+        if not eligible:
+            return
+        cap = max(1, int(cfg.max_retries_per_scan))
+        batch = eligible[:cap]
+        hashes = [h for h, _ in batch]
+        for h, torrent in batch:
+            state = self._torrent_state[h]
+            state["retry_count"] = int(state.get("retry_count") or 0) + 1
+            state["last_retry_at"] = now
+            self._remember(
+                torrent,
+                "recover",
+                f"auto-retry after debrid failure (attempt {state['retry_count']}/{cfg.max_retry_attempts})",
+                event_batch_id=event_batch_id,
+            )
+        await self._clear_failure_tags(hashes)
+        self._stats.actions += len(hashes)
+        self._emit(
+            "retry.auto",
+            f"Auto-retried {len(hashes)} failed torrent(s)"
+            + (f" ({len(eligible) - len(hashes)} deferred to next pass)" if len(eligible) > len(hashes) else ""),
+            event_batch_id=event_batch_id,
+            count=len(hashes),
+        )
+        self._mark_state_dirty()
+
+    def _arr_service_for_category(self, category: str) -> tuple[str, str, str] | None:
+        """Return (label, url, api_key) for the *arr service that manages
+        *category*, or None if no configured service matches.
+
+        No per-category *arr routing exists in config today -- this uses
+        the common qBittorrent+*arr convention of naming the category after
+        the app (``sonarr``/``radarr``), the only mapping available without
+        adding new per-category config.
+        """
+        arr = self._store.config.arr
+        cat = category.lower()
+        if "sonarr" in cat and arr.sonarr.enabled and arr.sonarr.url and arr.sonarr.api_key:
+            return ("sonarr", arr.sonarr.url, arr.sonarr.api_key)
+        if "radarr" in cat and arr.radarr.enabled and arr.radarr.url and arr.radarr.api_key:
+            return ("radarr", arr.radarr.url, arr.radarr.api_key)
+        return None
+
+    async def _recover_exhausted_via_arr(
+        self,
+        torrents: list[dict],
+        now: float,
+        *,
+        event_batch_id: int | None = None,
+    ) -> None:
+        """Search *arr for an alternative release once a torrent has
+        exhausted its auto-retry attempts (see ``_recover_failed``), instead
+        of leaving it permanently ``qbx-failed``. Opt-in and capped per
+        scan, same shape as the reannounce/retry sweeps.
+        """
+        cfg = self._store.config.interceptor
+        if not cfg.auto_replace_enabled:
+            return
+        eligible: list[dict] = []
+        for torrent in torrents:
+            h = torrent.get("hash", "")
+            if not h or h in self._inflight:
+                continue
+            tags = {s.strip() for s in (torrent.get("tags") or "").split(",") if s.strip()}
+            if TAG_FAILED not in tags:
+                continue
+            state = self._torrent_state.get(h, {})
+            if int(state.get("retry_count") or 0) < cfg.max_retry_attempts:
+                continue
+            if state.get("arr_replacement_triggered"):
+                continue
+            if self._arr_service_for_category(str(torrent.get("category") or "")) is None:
+                continue
+            eligible.append(torrent)
+        if not eligible:
+            return
+        cap = max(1, int(cfg.max_replacements_per_scan))
+        batch = eligible[:cap]
+        triggered = 0
+        for torrent in batch:
+            h = torrent["hash"]
+            name = torrent.get("name", h)
+            service = self._arr_service_for_category(str(torrent.get("category") or ""))
+            if service is None:  # pragma: no cover - re-checked defensively
+                continue
+            label, url, api_key = service
+            state = self._torrent_state.setdefault(h, {})
+            # Mark unconditionally, success or failure: a genuinely broken
+            # *arr call must not retry every scan forever either.
+            state["arr_replacement_triggered"] = True
+            self._mark_state_dirty()
+            try:
+                item = await arr_client.find_queue_item(url, api_key, h)
+                if item is None:
+                    self._emit(
+                        "arr.replace.skipped",
+                        f"'{name}' not found in {label} queue; nothing to replace",
+                        event_batch_id=event_batch_id,
+                        hash=h,
+                        name=name,
+                        service=label,
+                    )
+                    continue
+                await arr_client.replace_download(url, api_key, int(item["id"]))
+                triggered += 1
+                self._emit(
+                    "arr.replace.triggered",
+                    f"Blocklisted and searching for a replacement for '{name}' via {label}",
+                    event_batch_id=event_batch_id,
+                    hash=h,
+                    name=name,
+                    service=label,
+                )
+            except arr_client.ArrClientError as exc:
+                self._emit(
+                    "arr.replace.failed",
+                    f"Could not trigger a replacement search for '{name}' via {label}: {exc}",
+                    event_batch_id=event_batch_id,
+                    hash=h,
+                    name=name,
+                    service=label,
+                    error=str(exc),
+                )
+        if triggered:
+            self._stats.actions += triggered
 
     async def scan_once(self) -> dict:
         try:
@@ -445,9 +696,13 @@ class Interceptor:
             )
             category = self._store.config.interceptor.category_filter or None
             if self._store.config.duplicates.enabled:
-                await self._manage_duplicates(
-                    await self._qbt.torrents(category=category),
-                )
+                # Serve from the sync snapshot when populated; a manual scan
+                # must not force a full-library torrents/info fetch.
+                if self._snapshot_ready():
+                    dupe_pool = self._snapshot_torrents(category)
+                else:
+                    dupe_pool = await self._qbt.torrents(category=category)
+                await self._manage_duplicates(dupe_pool)
             await self._drain_queue(completion_source="scan")
             self._stats.last_error = ""
             self._stats.manual_scan_completed_count += 1
@@ -482,6 +737,11 @@ class Interceptor:
         if self._task:
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
+        if self._webseed_recovery_task:
+            self._webseed_recovery_task.cancel()
+            await asyncio.gather(self._webseed_recovery_task, return_exceptions=True)
+            self._webseed_recovery_task = None
+        await self._flush_state(force=True)
 
     def _emit(self, kind: str, message: str, **data) -> None:
         if self._events:
@@ -520,6 +780,9 @@ class Interceptor:
                         continue
                     continue
                 sync = await self._poll_sync()
+                if sync is not None and sync.get("changed"):
+                    await self._recover_missing_files(list(sync["changed"]))
+                await self._poll_webseed_errors()
                 now = time.time()
                 if sync is None:
                     if now - self._stats.last_health_at >= max(5, cfg.health_scan_seconds):
@@ -607,21 +870,530 @@ class Interceptor:
             except Exception as exc:  # pragma: no cover - loop must survive
                 self._stats.last_error = str(exc)
                 log.exception("interceptor scan failed: %s", exc)
+            await self._flush_state()
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=max(1, cfg.sync_poll_seconds))
             except asyncio.TimeoutError:
                 pass
 
+    async def _poll_webseed_errors(self) -> None:
+        if self._webseed_recovery_task and not self._webseed_recovery_task.done():
+            return
+        entries = await self._qbt.main_log(self._qbt_log_id)
+        if not entries:
+            return
+        self._qbt_log_id = max(
+            self._qbt_log_id,
+            *(int(entry.get("id") or -1) for entry in entries),
+        )
+        failures: dict[str, set[str]] = {}
+        for entry in entries:
+            match = _URL_SEED_ERROR_RE.search(str(entry.get("message") or ""))
+            if not match or not _EXPIRED_URL_ERROR_RE.search(match.group("error")):
+                continue
+            failures.setdefault(match.group("name"), set()).add(match.group("url"))
+        if not failures:
+            return
+
+        self._webseed_recovery_task = asyncio.create_task(
+            self._recover_logged_webseed_failures(failures),
+            name="qbx-webseed-recovery",
+        )
+
+    async def _recover_logged_webseed_failures(
+        self,
+        failures: dict[str, set[str]],
+    ) -> None:
+        by_name: dict[str, list[dict]] = {}
+        for torrent in self._sync_torrents.values():
+            by_name.setdefault(str(torrent.get("name") or ""), []).append(torrent)
+        for name, urls in failures.items():
+            for torrent in by_name.get(name, []):
+                h = str(torrent.get("hash") or "")
+                existing = await self._webseed_urls(h)
+                failed = {
+                    url
+                    for url in urls
+                    if url in existing
+                    or url.rstrip("/") in {current.rstrip("/") for current in existing}
+                }
+                if failed:
+                    await self._refresh_webseeds(torrent, failed, existing)
+
+    async def _refresh_webseeds(
+        self,
+        torrent: dict,
+        failed_urls: set[str],
+        existing_urls: set[str] | None = None,
+    ) -> None:
+        h = str(torrent.get("hash") or "")
+        name = str(torrent.get("name") or h)
+        if not h or h in self._inflight:
+            return
+        last_refresh = float(
+            self._torrent_state.get(h, {}).get("last_webseed_refresh_at") or 0
+        )
+        if time.time() - last_refresh < 300:
+            return
+        self._inflight.add(h)
+        try:
+            cfg = self._store.config.interceptor
+            self._emit(
+                "webseed.refresh.start",
+                f"Refreshing expired HTTP sources for '{name}'",
+                hash=h,
+                name=name,
+                failed_urls=len(failed_urls),
+            )
+            result = await self._debrid.refresh(
+                _magnet_for(torrent),
+                h,
+                max_wait_seconds=cfg.max_wait_minutes * 60,
+                poll_seconds=cfg.poll_seconds,
+                wanted_files=await self._wanted_files(h),
+            )
+            fresh_urls = list(dict.fromkeys(f.url for f in result.files if f.url))
+            if not fresh_urls:
+                raise DebridError("debrid returned no replacement URLs")
+
+            existing = existing_urls
+            if existing is None:
+                existing = await self._webseed_urls(h)
+            remembered = set(self._torrent_state.get(h, {}).get("webseed_urls") or [])
+            stale = sorted(existing & (set(failed_urls) | remembered))
+            if stale:
+                await self._remove_webseeds(h, stale)
+            await self._add_webseeds(h, fresh_urls)
+            await self._qbt.resume(h)
+            self._torrent_state.setdefault(h, {})["webseed_urls"] = fresh_urls
+            self._torrent_state[h]["last_webseed_refresh_at"] = time.time()
+            self._mark_state_dirty()
+            self._stats.actions += 1
+            self._emit(
+                "webseed.refresh.done",
+                f"Replaced expired HTTP sources for '{name}' via {result.provider}",
+                hash=h,
+                name=name,
+                provider=result.provider,
+                removed=len(stale),
+                added=len(fresh_urls),
+            )
+        except Exception as exc:
+            self._emit(
+                "webseed.refresh.failed",
+                f"Could not refresh HTTP sources for '{name}': {exc}",
+                hash=h,
+                name=name,
+                error=str(exc),
+            )
+        finally:
+            self._inflight.discard(h)
+
+    async def _validate_webseeds_on_transitions(
+        self,
+        torrents: list[dict],
+        previous_torrents: dict[str, dict],
+        *,
+        event_batch_id: int | None = None,
+    ) -> None:
+        """S7: validate a torrent's webseeds when it (re)enters a download state.
+
+        Reuses the dead-webseed machinery (`_find_dead_webseeds` /
+        `_refresh_webseeds`): dead URLs are removed immediately and a refresh
+        re-resolves fresh URLs if the provider still has the content. Budgeted
+        per event batch and deduped per torrent via a cooldown.
+        """
+        cfg = self._store.config.interceptor
+        budget = max(0, int(cfg.webseed_validate_budget_per_pass))
+        cooldown = max(0, int(cfg.webseed_validate_cooldown_seconds))
+        if not budget or not torrents:
+            return
+        now = time.time()
+        checked = 0
+        for t in torrents:
+            if checked >= budget:
+                break
+            h = str(t.get("hash") or "")
+            if not h or h in self._inflight or _is_complete(t):
+                continue
+            before = previous_torrents.get(h) or {}
+            prev_state = str(before.get("state") or "")
+            new_state = str(t.get("state") or "")
+            if not before or prev_state == new_state:
+                continue
+            entered_download = new_state in _WEBSEED_VALIDATE_DL_STATES
+            restarted = prev_state in _STOPPED_DL_STATES and new_state not in _STOPPED_DL_STATES
+            if not (entered_download or restarted):
+                continue
+            if not (_has_tag(t, TAG_WEBSEED) or self._torrent_state.get(h, {}).get("webseed_urls")):
+                continue
+            state = self._torrent_state.setdefault(h, {})
+            last = float(state.get("last_webseed_validate_at") or 0)
+            if cooldown and now - last < cooldown:
+                continue
+            state["last_webseed_validate_at"] = now
+            checked += 1
+            try:
+                existing = await self._webseed_urls(h)
+            except Exception:
+                continue
+            if not existing:
+                continue
+            sample = set(list(existing)[:_WEBSEED_HEALTHCHECK_SAMPLE])
+            dead = await self._find_dead_webseeds(sample)
+            if not dead:
+                continue
+            self._emit(
+                "webseed.validate.dead",
+                f"State change revealed {len(dead)} dead HTTP source(s) on "
+                f"'{t.get('name') or h}'",
+                event_batch_id=event_batch_id,
+                hash=h,
+                name=t.get("name") or h,
+                dead=len(dead),
+                state=new_state,
+                previous_state=prev_state,
+            )
+            # Remove the dead URLs up front (S7), then let the refresh
+            # machinery re-resolve if the provider still has content.
+            try:
+                await self._remove_webseeds(h, sorted(dead))
+            except Exception:
+                log.debug("failed to remove dead webseeds for %s", h, exc_info=True)
+            await self._refresh_webseeds(t, dead, existing - dead)
+        if checked:
+            self._mark_state_dirty()
+
+    async def _recover_missing_files(self, torrents: list[dict]) -> None:
+        now = time.time()
+        changed = False
+        for torrent in torrents:
+            h = str(torrent.get("hash") or "")
+            if not h:
+                continue
+            state = self._torrent_state.setdefault(h, {})
+            if torrent.get("state") != "missingFiles":
+                if state.pop("last_missing_files_recovery_at", None) is not None:
+                    changed = True
+                continue
+            last = float(state.get("last_missing_files_recovery_at") or 0)
+            if now - last < 60:
+                continue
+            state["last_missing_files_recovery_at"] = now
+            changed = True
+            try:
+                await self._qbt.recheck(h)
+                if self._queueing_enabled is True:
+                    await self._qbt.top_priority(h)
+                self._emit(
+                    "qbt.missing_files.recover",
+                    f"Rechecking missing files for '{torrent.get('name') or h}'",
+                    hash=h,
+                    name=torrent.get("name") or h,
+                    moved_to_top=self._queueing_enabled is True,
+                )
+            except Exception as exc:
+                self._emit(
+                    "qbt.missing_files.failed",
+                    f"Could not recheck missing files for '{torrent.get('name') or h}': {exc}",
+                    hash=h,
+                    name=torrent.get("name") or h,
+                    error=str(exc),
+                )
+        if changed:
+            self._mark_state_dirty()
+
+    async def _check_stale_webseeds(self, torrents: list[dict]) -> None:
+        """Proactively verify existing webseed URLs on already-managed torrents.
+
+        Complements ``_poll_webseed_errors``: a torrent that's gone fully
+        stalled stops asking qBittorrent to retry its dead webseed, so the
+        log never repeats the error and the reactive path never fires.
+
+        ``_process_torrents`` (this method's only caller) runs on every
+        event batch — every ``sync_poll_seconds`` (a few seconds) on a
+        library that's always changing something — not just the slower
+        health-scan cadence this was designed around. Gate on a global
+        cooldown so the expensive part below only actually runs at the
+        intended cadence regardless of call frequency.
+        """
+        now = time.time()
+        if now - self._last_stale_webseed_check_at < _WEBSEED_HEALTHCHECK_COOLDOWN:
+            return
+        self._last_stale_webseed_check_at = now
+        checked = 0
+        for torrent in torrents:
+            if checked >= _WEBSEED_HEALTHCHECK_BATCH:
+                break
+            h = str(torrent.get("hash") or "")
+            if not h or h in self._inflight or _is_complete(torrent):
+                continue
+            if not _has_tag(torrent, TAG_WEBSEED):
+                continue
+            state = self._torrent_state.setdefault(h, {})
+            last = float(state.get("last_webseed_healthcheck_at") or 0)
+            if now - last < _WEBSEED_HEALTHCHECK_COOLDOWN:
+                continue
+            state["last_webseed_healthcheck_at"] = now
+            checked += 1
+            try:
+                existing = await self._webseed_urls(h)
+            except Exception:
+                continue
+            if not existing:
+                continue
+            # Some torrents carry hundreds of webseed URLs (one debrid link
+            # per file). A handful is plenty of signal — if any sampled URL
+            # in a batch is dead, the whole batch usually came from the same
+            # expired debrid session, and _refresh_webseeds re-fetches all
+            # fresh URLs from debrid rather than patching one at a time.
+            sample = set(list(existing)[:_WEBSEED_HEALTHCHECK_SAMPLE])
+            dead = await self._find_dead_webseeds(sample)
+            if dead:
+                await self._refresh_webseeds(torrent, dead, existing)
+        if checked:
+            self._mark_state_dirty()
+
+    async def _enforce_download_only_stops(
+        self,
+        torrents: list[dict],
+        now: float,
+        *,
+        event_batch_id: int | None = None,
+    ) -> None:
+        """S8: stop torrents observed seeding when download_only is on.
+
+        Snapshot-driven and budgeted per pass. Uses torrents/stop (via the
+        client's pause/stop shim) — never setUploadLimit 0, which means
+        *unlimited*, and never super seeding.
+        """
+        cfg = self._store.config.interceptor
+        if not cfg.download_only:
+            return
+        budget = max(0, int(cfg.download_only_stop_budget_per_pass))
+        if not budget:
+            return
+        to_stop: list[str] = []
+        for t in torrents:
+            if len(to_stop) >= budget:
+                break
+            h = t.get("hash", "")
+            if not h or h in self._inflight:
+                continue
+            if t.get("state", "") not in SEEDING_STOP_STATES:
+                continue
+            state = self._torrent_state.setdefault(h, {})
+            last = float(state.get("download_only_stopped_at") or 0)
+            if now - last < _DOWNLOAD_ONLY_STOP_COOLDOWN:
+                continue
+            state["download_only_stopped_at"] = now
+            to_stop.append(h)
+        if not to_stop:
+            return
+        await self._qbt.pause(to_stop)
+        self._stats.actions += len(to_stop)
+        self._emit(
+            "download_only.stopped",
+            f"Stopped {len(to_stop)} seeding torrent(s) (download-only mode)",
+            event_batch_id=event_batch_id,
+            count=len(to_stop),
+        )
+        self._mark_state_dirty()
+
+    async def _apply_download_only_limits(self, hashes: list[str] | str) -> None:
+        """S8: pin share limits to ratio 0 + Stop so qBittorrent stops at
+        completion instead of seeding. Best-effort — a failure here must not
+        fail the webseed handoff or completion reconcile."""
+        if not hashes or not self._store.config.interceptor.download_only:
+            return
+        set_limits = getattr(self._qbt, "set_share_limits", None)
+        if set_limits is None:
+            return
+        try:
+            await set_limits(
+                hashes,
+                ratio_limit=0,
+                seeding_time_limit=0,
+                inactive_seeding_time_limit=0,
+                share_limit_action="Stop",
+            )
+        except Exception as exc:
+            log.debug("set_share_limits failed for %s: %s", hashes, exc)
+
+    async def _recover_post_intercept_stalled(
+        self,
+        torrents: list[dict],
+        now: float,
+        *,
+        event_batch_id: int | None = None,
+    ) -> None:
+        """Escalate torrents qbx already handed off to webseed delivery that
+        have since stopped making progress inside qBittorrent.
+
+        ``_check_stale_webseeds`` catches a URL that no longer responds; it
+        does not catch a URL that responds fine to an HTTP HEAD but that
+        qBittorrent isn't actually pulling data from (rate limits, a stuck
+        connection, etc). This sweep looks at progress instead of URL
+        liveness: reannounce and bump priority first (cheap, often enough to
+        unstick a queue-side stall); if that doesn't help within the same
+        threshold again, force a webseed refresh even though the URL wasn't
+        flagged dead.
+        """
+        cfg = self._store.config.interceptor
+        if not cfg.post_intercept_stall_minutes:
+            return
+        threshold = cfg.post_intercept_stall_minutes * 60
+        eligible: list[tuple[str, dict, float]] = []
+        for t in torrents:
+            h = t.get("hash", "")
+            if not h or h in self._inflight or _is_complete(t):
+                continue
+            if not _has_tag(t, TAG_WEBSEED):
+                continue
+            state = self._torrent_state.setdefault(h, {})
+            last_progress = float(state.get("last_progress_at") or state.get("first_seen_at") or now)
+            age = now - last_progress
+            if age < threshold:
+                continue
+            last_escalation = float(state.get("last_post_intercept_escalation_at") or 0)
+            if now - last_escalation < threshold:
+                continue
+            eligible.append((h, t, age))
+        if not eligible:
+            return
+        cap = max(1, int(cfg.post_intercept_max_escalations_per_scan))
+        batch = eligible[:cap]
+        reannounce_hashes: list[str] = []
+        refresh_targets: list[dict] = []
+        for h, t, age in batch:
+            state = self._torrent_state[h]
+            state["last_post_intercept_escalation_at"] = now
+            escalated_before = bool(state.get("post_intercept_escalated"))
+            state["post_intercept_escalated"] = True
+            stage = "refresh_webseed" if escalated_before else "reannounce_and_bump"
+            self._remember(
+                t,
+                "recover",
+                f"stalled {int(age // 60)}m after webseed handoff; escalating: {stage}",
+                event_batch_id=event_batch_id,
+            )
+            if stage == "reannounce_and_bump":
+                reannounce_hashes.append(h)
+            else:
+                refresh_targets.append(t)
+        if reannounce_hashes:
+            await self._qbt.reannounce(reannounce_hashes)
+            if self._queueing_enabled is True:
+                await self._qbt.top_priority(reannounce_hashes)
+        for t in refresh_targets:
+            h = t.get("hash", "")
+            try:
+                existing = await self._webseed_urls(h)
+            except Exception:
+                continue
+            if existing:
+                await self._refresh_webseeds(t, existing, existing)
+        self._stats.actions += len(batch)
+        self._emit(
+            "stalled.post_intercept.escalate",
+            f"Escalated {len(batch)} post-webseed stalled torrent(s)"
+            + (f" ({len(eligible) - len(batch)} deferred to next pass)" if len(eligible) > len(batch) else ""),
+            event_batch_id=event_batch_id,
+            count=len(batch),
+            reannounced=len(reannounce_hashes),
+            refreshed=len(refresh_targets),
+        )
+        self._mark_state_dirty()
+
+    async def _wanted_files(self, torrent_hash: str) -> list[WantedFile] | None:
+        """Files qBittorrent still wants (priority > 0) and lacks (progress < 1).
+
+        One torrents/files call for the torrent being handled — never a
+        library sweep. Returns None when there is nothing to narrow (no
+        metadata yet, nothing wanted, or every file is wanted) so providers
+        keep the cheap select-everything path.
+        """
+        try:
+            files = await self._qbt.files(torrent_hash)
+        except Exception:
+            return None
+        if not files:
+            return None
+        wanted = [
+            WantedFile(name=str(f.get("name") or ""), size=int(f.get("size") or 0))
+            for f in files
+            if f.get("name")
+            and int(f.get("priority", 1) or 0) > 0
+            and float(f.get("progress") or 0) < 1
+        ]
+        if not wanted or len(wanted) >= len(files):
+            return None
+        return wanted
+
+    async def _webseed_urls(self, torrent_hash: str) -> set[str]:
+        """Current webseed URLs for a torrent, cached for webseed_cache_seconds.
+
+        The staleness sweep and recovery paths re-read the same URLs every
+        pass; without a TTL cache that is one torrents/webseeds GET per
+        torrent per pass. The cache is invalidated whenever qbx itself adds
+        or removes webseeds for the hash.
+        """
+        ttl = max(0, int(self._store.config.interceptor.webseed_cache_seconds))
+        now = time.time()
+        cached = self._webseed_url_cache.get(torrent_hash)
+        if cached is not None and ttl and now - cached[0] < ttl:
+            return set(cached[1])
+        urls = {
+            str(item.get("url") or "")
+            for item in await self._qbt.webseeds(torrent_hash)
+            if item.get("url")
+        }
+        self._webseed_url_cache[torrent_hash] = (now, sorted(urls))
+        return urls
+
+    async def _add_webseeds(self, torrent_hash: str, urls: list[str]) -> None:
+        self._webseed_url_cache.pop(torrent_hash, None)
+        await self._qbt.add_webseeds(torrent_hash, urls)
+
+    async def _remove_webseeds(self, torrent_hash: str, urls: list[str]) -> None:
+        self._webseed_url_cache.pop(torrent_hash, None)
+        await self._qbt.remove_webseeds(torrent_hash, urls)
+
+    async def _find_dead_webseeds(self, urls: set[str]) -> set[str]:
+        kwargs = httpx_kwargs(self._store.config.anonymity)
+        kwargs["timeout"] = 10.0
+        dead: set[str] = set()
+        limiter = asyncio.Semaphore(_WEBSEED_HEALTHCHECK_CONCURRENCY)
+        async with httpx.AsyncClient(**kwargs) as client:
+
+            async def _check(url: str) -> None:
+                async with limiter:
+                    try:
+                        resp = await client.head(url)
+                        if resp.status_code in _WEBSEED_DEAD_STATUS:
+                            dead.add(url)
+                    except httpx.RequestError:
+                        pass
+
+            await asyncio.gather(*(_check(url) for url in urls))
+        return dead
+
     async def _scan_once(self) -> None:
         """Health/manual-style policy pass over the current torrent list."""
         cfg = self._store.config.interceptor
         category = cfg.category_filter or None
-        try:
-            torrents = await self._qbt.torrents(category=category)
-            self._mark_qbt_ok()
-        except Exception as exc:
-            self._mark_qbt_error(exc)
-            raise
+        if self._snapshot_ready():
+            # The sync snapshot is authoritative between maindata deltas; a
+            # full torrents/info fetch every health scan re-serializes the
+            # entire library once a minute for no new information.
+            torrents = self._snapshot_torrents(category)
+        else:
+            try:
+                torrents = await self._qbt.torrents(category=category)
+                self._mark_qbt_ok()
+            except Exception as exc:
+                self._mark_qbt_error(exc)
+                raise
         manage_duplicates = bool(
             self._store.config.duplicates.enabled
             and (self._debrid.enabled or cfg.manage_without_debrid)
@@ -638,13 +1410,20 @@ class Interceptor:
     async def _drain_queue(self, *, completion_source: str, event_batch_id: int | None = None) -> int:
         """Process eligible torrents one-at-a-time, capped by max_debrid_per_scan."""
         cfg = self._store.config.interceptor
-        category = cfg.category_filter or None
-        try:
-            await self._qbt.torrents(filter="stalledDL", sort="queue", limit=1, category=category)
-            self._mark_qbt_ok()
-        except Exception as exc:
-            self._mark_qbt_error(exc)
-            raise
+        if not self._qbt_recently_ok():
+            # Connectivity probe only. app/version is O(1) for qBittorrent;
+            # the old torrents/info probe forced a filter+sort over the whole
+            # library. Fakes/clients without version() keep the cheap old call.
+            probe = getattr(self._qbt, "version", None)
+            try:
+                if probe is not None:
+                    await probe()
+                else:
+                    await self._qbt.torrents(filter="stalledDL", limit=1)
+                self._mark_qbt_ok()
+            except Exception as exc:
+                self._mark_qbt_error(exc)
+                raise
         if not cfg.enabled or not self._debrid.enabled:
             return 0
         budget = max(0, int(cfg.max_debrid_per_scan))
@@ -700,7 +1479,7 @@ class Interceptor:
                 observed=0,
             )
 
-            frontier = await self._fetch_queue_frontier_from_api(category)
+            frontier = await self._fetch_queue_frontier(category)
             frontier_key = frontier["key"]
             frontier_position = frontier["position"]
             frontier_source = frontier["source"]
@@ -710,21 +1489,10 @@ class Interceptor:
             examined = 0
             candidates_seen = 0
             picked: dict | None = None
-            offset = 0
+            frontier_blocked_candidates: list[dict] = []
 
-            while True:
-                page = await self._qbt.torrents(
-                    filter="stalledDL",
-                    category=category,
-                    sort="queue",
-                    limit=1,
-                    offset=offset,
-                )
-                if not page:
-                    break
-                torrent = page[0]
+            async for torrent in self._iter_stalled_queue(category):
                 examined += 1
-                offset += 1
                 self._observe_torrents([torrent], now)
                 ok, reason = self._candidate_reason(torrent, now, duplicate_hashes)
                 self._remember(
@@ -742,9 +1510,14 @@ class Interceptor:
                 candidates_seen += 1
                 candidate_key = _priority_key(torrent, self._queueing_enabled)
                 if frontier_key is not None and candidate_key > frontier_key:
+                    # Frontier gating stays (S6): this candidate sits behind
+                    # the active queue frontier. FCFS iteration order means a
+                    # later candidate may still be pickable, so keep scanning
+                    # instead of aborting the pass.
                     blocked = _candidate_brief(torrent)
                     blocked["blocked_by_queue_frontier"] = frontier_position
                     blocked["blocked_by_queue_source"] = frontier_source
+                    frontier_blocked_candidates.append(blocked)
                     self._remember(
                         torrent,
                         "skip",
@@ -769,48 +1542,52 @@ class Interceptor:
                         blocked_by_queue_source=frontier_source,
                         event_batch_id=event_batch_id,
                     )
-                    self._stats.queue_frontier_blocked = 1
-                    self._stats.queue_frontier_blocked_candidates = [blocked]
-                    self._stats.queue_frontier_position = frontier_position
-                    self._stats.queue_frontier_source = frontier_source
-                    self._stats.candidates = candidates_seen
-                    self._stats.pending_count = 0
-                    self._stats.deferred_count = max(0, candidates_seen - 1)
-                    self._stats.skip_reasons = skip_reasons
-                    self._stats.queue_confirmation_waiting = queue_confirmation_waiting
-                    self._stats.observed = examined
-                    self._emit(
-                        "scan.summary",
-                        f"Queue head blocked behind frontier "
-                        f"(q#{frontier_position if frontier_position is not None else frontier_source})",
-                        observed=examined,
-                        event_batch_id=event_batch_id,
-                        candidates=candidates_seen,
-                        pending=0,
-                        deferred=self._stats.deferred_count,
-                        frontier_blocked=1,
-                        queue_frontier_position=frontier_position,
-                        queue_frontier_source=frontier_source,
-                        queue_frontier_blocked_candidates=[blocked],
-                        duplicates=0,
-                        skip_reasons=skip_reasons,
-                        queue_confirmation_waiting=queue_confirmation_waiting,
-                        pending_candidates=[],
-                        deferred_candidates=[],
-                        debrid_enabled=self._debrid.enabled,
-                    )
-                    self._emit(
-                        "scan.queue.frontier",
-                        "1 stalled candidate(s) blocked behind the queue frontier",
-                        blocked=1,
-                        event_batch_id=event_batch_id,
-                        frontier_position=frontier_position,
-                        frontier_source=frontier_source,
-                    )
-                    return False
+                    continue
 
                 picked = torrent
                 break
+
+            if picked is None and frontier_blocked_candidates:
+                blocked_count = len(frontier_blocked_candidates)
+                self._stats.queue_frontier_blocked = blocked_count
+                self._stats.queue_frontier_blocked_candidates = frontier_blocked_candidates
+                self._stats.queue_frontier_position = frontier_position
+                self._stats.queue_frontier_source = frontier_source
+                self._stats.candidates = candidates_seen
+                self._stats.pending_count = 0
+                self._stats.deferred_count = 0
+                self._stats.skip_reasons = skip_reasons
+                self._stats.queue_confirmation_waiting = queue_confirmation_waiting
+                self._stats.observed = examined
+                self._emit(
+                    "scan.summary",
+                    f"Queue head blocked behind frontier "
+                    f"(q#{frontier_position if frontier_position is not None else frontier_source})",
+                    observed=examined,
+                    event_batch_id=event_batch_id,
+                    candidates=candidates_seen,
+                    pending=0,
+                    deferred=0,
+                    frontier_blocked=blocked_count,
+                    queue_frontier_position=frontier_position,
+                    queue_frontier_source=frontier_source,
+                    queue_frontier_blocked_candidates=frontier_blocked_candidates,
+                    duplicates=0,
+                    skip_reasons=skip_reasons,
+                    queue_confirmation_waiting=queue_confirmation_waiting,
+                    pending_candidates=[],
+                    deferred_candidates=[],
+                    debrid_enabled=self._debrid.enabled,
+                )
+                self._emit(
+                    "scan.queue.frontier",
+                    f"{blocked_count} stalled candidate(s) blocked behind the queue frontier",
+                    blocked=blocked_count,
+                    event_batch_id=event_batch_id,
+                    frontier_position=frontier_position,
+                    frontier_source=frontier_source,
+                )
+                return False
 
             if picked is None:
                 self._stats.observed = examined
@@ -863,9 +1640,11 @@ class Interceptor:
             self._stats.observed = examined
             self._stats.candidates = candidates_seen
             self._stats.pending_count = 1
-            self._stats.deferred_count = max(0, candidates_seen - 1)
-            self._stats.queue_frontier_blocked = 0
-            self._stats.queue_frontier_blocked_candidates = []
+            self._stats.deferred_count = max(
+                0, candidates_seen - 1 - len(frontier_blocked_candidates)
+            )
+            self._stats.queue_frontier_blocked = len(frontier_blocked_candidates)
+            self._stats.queue_frontier_blocked_candidates = frontier_blocked_candidates
             self._stats.queue_frontier_position = frontier_position
             self._stats.queue_frontier_source = frontier_source
             self._stats.skip_reasons = skip_reasons
@@ -879,10 +1658,10 @@ class Interceptor:
                 candidates=candidates_seen,
                 pending=1,
                 deferred=self._stats.deferred_count,
-                frontier_blocked=0,
+                frontier_blocked=len(frontier_blocked_candidates),
                 queue_frontier_position=frontier_position,
                 queue_frontier_source=frontier_source,
-                queue_frontier_blocked_candidates=[],
+                queue_frontier_blocked_candidates=frontier_blocked_candidates,
                 duplicates=0,
                 skip_reasons=skip_reasons,
                 queue_confirmation_waiting=queue_confirmation_waiting,
@@ -893,7 +1672,17 @@ class Interceptor:
             if cfg.tag_candidates:
                 await self._qbt.add_tags(picked["hash"], TAG_CANDIDATE)
 
-        await self._handle(picked, event_batch_id=event_batch_id)
+        # Dispatch, don't await: a single slow or never-ready debrid
+        # resolution must not block the rest of this loop (health scans,
+        # auto-retry, escalation sweeps) for up to max_wait_minutes. Add to
+        # _inflight immediately (not just inside _handle's first line) so a
+        # second pick in the same event-loop tick can't race ahead of the
+        # scheduled task and pick this same torrent again.
+        self._inflight.add(picked["hash"])
+        asyncio.create_task(
+            self._handle(picked, event_batch_id=event_batch_id),
+            name=f"qbx-handle-{picked['hash'][:8]}",
+        )
         completed_at = time.time()
         self._stats.last_policy_pass = {
             "policy_pass_id": pass_id,
@@ -909,7 +1698,7 @@ class Interceptor:
         }
         self._emit(
             "policy.pass.complete",
-            f"Policy pass #{pass_id} ({completion_source}) complete",
+            f"Policy pass #{pass_id} ({completion_source}) dispatched candidate for debrid",
             policy_pass_id=pass_id,
             event_batch_id=event_batch_id,
             source=completion_source,
@@ -919,8 +1708,53 @@ class Interceptor:
         )
         return True
 
-    async def _fetch_queue_frontier_from_api(self, category: str | None) -> dict[str, object]:
-        """Return the active queue head using small, targeted qBittorrent queries."""
+    def _stalled_snapshot(self, category: str | None) -> list[dict]:
+        """Stalled torrents from the sync snapshot, in FCFS offload order.
+
+        First-stalled-first (S6), tie-broken by the existing queue-order key;
+        torrents that have not crossed the stall_after gate sort last in
+        plain queue order.
+        """
+        now = time.time()
+        stalled = [
+            t for t in self._snapshot_torrents(category)
+            if t.get("state") == "stalledDL"
+        ]
+        stalled.sort(key=lambda t: self._fcfs_key(t, now))
+        return stalled
+
+    async def _iter_stalled_queue(self, category: str | None):
+        """Yield stalled torrents in queue order.
+
+        Serves from the in-memory sync snapshot when it is populated (zero
+        qBittorrent API calls). Falls back to one-at-a-time torrents/info
+        paging only when sync/maindata has never delivered (degraded mode),
+        so both paths share the same candidate-evaluation loop.
+        """
+        if self._sync_torrents:
+            for torrent in self._stalled_snapshot(category):
+                yield torrent
+            return
+        offset = 0
+        while True:
+            page = await self._qbt.torrents(
+                filter="stalledDL",
+                category=category,
+                sort="queue",
+                limit=1,
+                offset=offset,
+            )
+            if not page:
+                return
+            offset += 1
+            yield page[0]
+
+    async def _fetch_queue_frontier(self, category: str | None) -> dict[str, object]:
+        """Return the active queue head, preferring the sync snapshot.
+
+        Only when the snapshot is empty does this fall back to small,
+        targeted qBittorrent queries.
+        """
         if self._queueing_enabled is False:
             return {"position": None, "key": None, "source": "disabled"}
         blocker_states = ACTIVE_DOWNLOAD_STATES | {
@@ -931,20 +1765,26 @@ class Interceptor:
             "moving",
         }
         blockers: list[dict] = []
-        for flt in ("downloading", "queuedDL"):
-            try:
-                batch = await self._qbt.torrents(
-                    filter=flt,
-                    category=category,
-                    sort="queue",
-                    limit=5,
-                )
-            except QbtError:
-                continue
-            blockers.extend(
-                t for t in batch
+        if self._sync_torrents:
+            blockers = [
+                t for t in self._snapshot_torrents(category)
                 if not _is_complete(t) and t.get("state", "") in blocker_states
-            )
+            ]
+        else:
+            for flt in ("downloading", "queuedDL"):
+                try:
+                    batch = await self._qbt.torrents(
+                        filter=flt,
+                        category=category,
+                        sort="queue",
+                        limit=5,
+                    )
+                except QbtError:
+                    continue
+                blockers.extend(
+                    t for t in batch
+                    if not _is_complete(t) and t.get("state", "") in blocker_states
+                )
         if not blockers:
             return {"position": None, "key": None, "source": "none"}
         positions = [(_queue_position(t), t) for t in blockers if _queue_position(t) is not None]
@@ -991,7 +1831,7 @@ class Interceptor:
             count=1,
             hash=h,
         )
-        self._save_state()
+        self._mark_state_dirty()
 
     def _schedule_queue_chain(self) -> None:
         if self._queue_chain_task and not self._queue_chain_task.done():
@@ -1046,6 +1886,11 @@ class Interceptor:
             current.update(torrent)
             current.setdefault("hash", h)
             self._sync_torrents[h] = current
+        await self._recover_missing_files(torrents)
+        await self._sample_file_stalls(torrents, now)
+        await self._enforce_download_only_stops(torrents, now, event_batch_id=event_batch_id)
+        await self._check_stale_webseeds(torrents)
+        await self._recover_post_intercept_stalled(torrents, now, event_batch_id=event_batch_id)
         await self._reconcile_completed_torrents(torrents, completion_source=completion_source)
         await self._reconcile_recovered_torrents(torrents, completion_source=completion_source)
         if not self._duplicates_suppress_debrid():
@@ -1069,6 +1914,8 @@ class Interceptor:
             reason=completion_source,
         )
         await self._recover_stalled(torrents, duplicate_hashes, now, event_batch_id=event_batch_id)
+        await self._recover_failed(torrents, now, event_batch_id=event_batch_id)
+        await self._recover_exhausted_via_arr(torrents, now, event_batch_id=event_batch_id)
         candidates: list[dict] = []
         clear_candidates: list[str] = []
         skip_reasons: dict[str, int] = {}
@@ -1093,7 +1940,7 @@ class Interceptor:
                 if _has_tag(torrent, TAG_CANDIDATE):
                     clear_candidates.append(torrent["hash"])
 
-        candidates.sort(key=lambda torrent: _priority_key(torrent, self._queueing_enabled))
+        candidates.sort(key=lambda torrent: self._fcfs_key(torrent, now))
         queue_frontier = _queue_frontier(torrents, self._queueing_enabled)
         queue_frontier_position = queue_frontier["position"]
         queue_frontier_source = queue_frontier["source"]
@@ -1271,7 +2118,25 @@ class Interceptor:
             async with sem:
                 await self._handle(t, event_batch_id=event_batch_id, chain=False)
 
-        await asyncio.gather(*(_guarded(t) for t in pending), return_exceptions=True)
+        # Dispatch, don't await: this is the candidate-handoff path every
+        # scan pass (manual and health-scan alike) goes through. Awaiting
+        # the gather here means one slow or never-ready debrid resolution
+        # blocks this whole call -- and by extension _scan_once()'s caller,
+        # which starves health scans, auto-retry, and every other
+        # maintenance sweep gated behind the same loop for as long as that
+        # one candidate takes (up to max_wait_minutes). Add to _inflight
+        # immediately, before scheduling, so a second pass in the same
+        # event-loop tick can't race ahead of the dispatched task and pick
+        # the same torrent again.
+        for t in pending:
+            h = t.get("hash", "")
+            if h:
+                self._inflight.add(h)
+
+        async def _dispatch_all() -> None:
+            await asyncio.gather(*(_guarded(t) for t in pending), return_exceptions=True)
+
+        asyncio.create_task(_dispatch_all(), name=f"qbx-dispatch-{pass_id}")
         completed_at = time.time()
         self._stats.last_policy_pass.update({
             "deferred": deferred,
@@ -1290,7 +2155,7 @@ class Interceptor:
         })
         self._emit(
             "policy.pass.complete",
-            f"Policy pass #{pass_id} ({completion_source}) complete",
+            f"Policy pass #{pass_id} ({completion_source}) dispatched {len(pending)} candidate(s) for debrid",
             policy_pass_id=pass_id,
             event_batch_id=event_batch_id,
             source=completion_source,
@@ -1354,6 +2219,8 @@ class Interceptor:
             "scan": "scan_completed_count",
             "sync": "sync_completed_count",
         }.get(completion_source, "scan_completed_count")
+        clear_tag_hashes: list[str] = []
+        done_hashes: list[str] = []
         for torrent in torrents:
             if not _is_complete(torrent):
                 continue
@@ -1363,14 +2230,24 @@ class Interceptor:
             if not managed:
                 # Do not stamp qbx-done on the entire seeding library.
                 continue
-            if tags & {TAG_ACTIVE, TAG_CANDIDATE, TAG_STALLED}:
-                await self._qbt.remove_tags(h, TAG_ACTIVE)
-                await self._qbt.remove_tags(h, TAG_CANDIDATE)
-                await self._qbt.remove_tags(h, TAG_STALLED)
+            if h and tags & {TAG_ACTIVE, TAG_CANDIDATE, TAG_STALLED}:
+                clear_tag_hashes.append(h)
             if TAG_DONE in tags:
                 continue
-            await self._qbt.add_tags(h, TAG_DONE)
+            if h:
+                done_hashes.append(h)
             completed.append(h or torrent.get("name", ""))
+        # Batched tag application: addTags/removeTags accept hashes=h1|h2 and
+        # comma-joined tags, so a 100-torrent completion batch costs two tag
+        # calls, not up to four per torrent.
+        if clear_tag_hashes:
+            await self._qbt.remove_tags(
+                clear_tag_hashes, f"{TAG_ACTIVE},{TAG_CANDIDATE},{TAG_STALLED}"
+            )
+        if done_hashes:
+            await self._qbt.add_tags(done_hashes, TAG_DONE)
+            # S8: completed torrents must stop, not seed.
+            await self._apply_download_only_limits(done_hashes)
         if completed:
             current = getattr(self._stats, stats_attr, 0)
             setattr(self._stats, stats_attr, current + len(completed))
@@ -1384,6 +2261,7 @@ class Interceptor:
             "scan": "scan.recovered",
             "sync": "sync.recovered",
         }.get(completion_source, f"{completion_source}.recovered")
+        recovered_hashes: list[str] = []
         for torrent in torrents:
             if _is_complete(torrent) or self._looks_stalled(torrent):
                 continue
@@ -1392,10 +2270,12 @@ class Interceptor:
             if not tags & {TAG_CANDIDATE, TAG_STALLED}:
                 continue
             if h:
-                await self._qbt.remove_tags(h, TAG_CANDIDATE)
-                await self._qbt.remove_tags(h, TAG_STALLED)
+                recovered_hashes.append(h)
                 self._sync_local_tags(h, remove={TAG_CANDIDATE, TAG_STALLED})
             recovered.append(h or torrent.get("name", ""))
+        if recovered_hashes:
+            # Batched: one removeTags call for the whole pass, not two per torrent.
+            await self._qbt.remove_tags(recovered_hashes, f"{TAG_CANDIDATE},{TAG_STALLED}")
         if recovered:
             self._stats.recovered_count += len(recovered)
             self._stats.last_recovered_at = time.time()
@@ -1415,8 +2295,21 @@ class Interceptor:
         previous_rid = self._sync_rid
         self._sync_rid = int(data.get("rid", self._sync_rid))
         queueing_changed = False
-        if data.get("queueing") is not None:
-            queueing_changed = self._set_queueing_state(bool(data.get("queueing")), "reported")
+        reported_queueing = data.get("queueing")
+        if reported_queueing is None and isinstance(data.get("server_state"), dict):
+            reported_queueing = data["server_state"].get("queueing")
+        if reported_queueing is not None:
+            queueing_changed = self._set_queueing_state(bool(reported_queueing), "reported")
+            self._queueing_checked = True
+        elif not self._queueing_checked:
+            prefs = await self._qbt.preferences()
+            pref_queueing = prefs.get("queueing_enabled")
+            if pref_queueing is not None:
+                queueing_changed = self._set_queueing_state(
+                    bool(pref_queueing),
+                    "preferences",
+                )
+            self._queueing_checked = True
         removed = list(data.get("torrents_removed", []) or [])
         previous_torrents = {
             h: dict(self._sync_torrents.get(h, {}))
@@ -1436,18 +2329,11 @@ class Interceptor:
         for h in removed:
             self._sync_torrents.pop(h, None)
             self._torrent_state.pop(h, None)
+            self._webseed_url_cache.pop(h, None)
+            self._file_stall.drop(h)
         changed: list[dict] = []
         for h, patch in (data.get("torrents") or {}).items():
-            current = dict(self._sync_torrents.get(h, {}))
-            current.update({k: v for k, v in patch.items() if k != "tags"})
-            current_tags = {s.strip() for s in (self._sync_torrents.get(h, {}).get("tags") or "").split(",") if s.strip()}
-            patch_tags = {s.strip() for s in (patch.get("tags") or "").split(",") if s.strip()}
-            merged_tags = sorted(current_tags | patch_tags)
-            if merged_tags:
-                current["tags"] = ",".join(merged_tags)
-            current.setdefault("hash", h)
-            self._sync_torrents[h] = current
-            changed.append(current)
+            changed.append(self._apply_sync_patch(h, patch))
         if data.get("full_update"):
             self._prune_missing_torrent_state()
         completed = await self._reconcile_completed_torrents(changed, completion_source="sync")
@@ -1475,6 +2361,29 @@ class Interceptor:
             "full_update": bool(data.get("full_update")),
         }
 
+    def _apply_sync_patch(self, h: str, patch: dict) -> dict:
+        """Merge one sync/maindata torrent patch into the snapshot.
+
+        maindata patches carry the full new value for every field that
+        changed — including ``tags`` — so a plain update gives replacement
+        semantics. Unioning tags would resurrect upstream tag removals.
+        """
+        current = dict(self._sync_torrents.get(h, {}))
+        current.update(patch)
+        current.setdefault("hash", h)
+        self._sync_torrents[h] = current
+        return current
+
+    def _snapshot_ready(self) -> bool:
+        """True when the snapshot was fed by sync/maindata at least once.
+
+        ``_process_torrents`` warms ``_sync_torrents`` from its own inputs
+        (to keep local tag mirrors working), so a populated dict alone does
+        not prove maindata ever delivered — in degraded mode the health scan
+        must keep fetching fresh data from the API.
+        """
+        return bool(self._sync_torrents) and self._stats.last_sync_at > 0
+
     def _snapshot_torrents(self, category: str | None = None) -> list[dict]:
         torrents = list(self._sync_torrents.values())
         if category is not None:
@@ -1495,16 +2404,10 @@ class Interceptor:
             for h in data.get("torrents_removed", []) or []:
                 self._sync_torrents.pop(h, None)
                 self._torrent_state.pop(h, None)
+                self._webseed_url_cache.pop(h, None)
+                self._file_stall.drop(h)
             for h, patch in (data.get("torrents") or {}).items():
-                current = dict(self._sync_torrents.get(h, {}))
-                current.update({k: v for k, v in patch.items() if k != "tags"})
-                current_tags = {s.strip() for s in (self._sync_torrents.get(h, {}).get("tags") or "").split(",") if s.strip()}
-                patch_tags = {s.strip() for s in (patch.get("tags") or "").split(",") if s.strip()}
-                merged_tags = sorted(current_tags | patch_tags)
-                if merged_tags:
-                    current["tags"] = ",".join(merged_tags)
-                current.setdefault("hash", h)
-                self._sync_torrents[h] = current
+                self._apply_sync_patch(h, patch)
             if data.get("full_update"):
                 self._prune_missing_torrent_state()
             if removed:
@@ -1553,12 +2456,21 @@ class Interceptor:
                 event_batch_id=event_batch_id,
             )
         self._emit_event_feedback(scoped, removed, previous_torrents or {}, queueing_changed)
+        # S7: torrents (re)entering a download state get their webseed URLs
+        # HEAD-validated (budgeted, per-torrent cooldown).
+        await self._validate_webseeds_on_transitions(
+            scoped,
+            previous_torrents or {},
+            event_batch_id=event_batch_id,
+        )
         if removed:
             self._emit("event.removed", f"qBittorrent removed {len(removed)} torrent(s)", removed=removed)
             self._stats.event_removed_count += len(removed)
             for h in removed:
                 self._sync_torrents.pop(h, None)
                 self._torrent_state.pop(h, None)
+                self._webseed_url_cache.pop(h, None)
+                self._file_stall.drop(h)
         if event_batch_id is not None:
             self._stats.event_last_batch_id = event_batch_id
             if queueing_changed and (scoped or removed):
@@ -1583,6 +2495,31 @@ class Interceptor:
             queueing_changed=queueing_changed,
         )
         if scoped or removed or queueing_changed or policy_triggered:
+            # Debounce full event passes: sync batches land every few seconds
+            # on a busy library, and each full pass walks every torrent. Adds
+            # and removals still trigger immediately; manual/health scans do
+            # not go through this path and are never debounced.
+            has_new_adds = any(
+                not (previous_torrents or {}).get(t.get("hash", ""))
+                for t in scoped
+            )
+            min_interval = max(0, int(cfg_ic.policy_min_interval_seconds))
+            since_last = now - self._last_event_policy_at
+            if (
+                min_interval
+                and not has_new_adds
+                and not removed
+                and since_last < min_interval
+            ):
+                self._emit(
+                    "policy.pass.debounced",
+                    f"Skipped event policy pass ({int(since_last)}s since last, "
+                    f"min interval {min_interval}s)",
+                    event_batch_id=event_batch_id,
+                    since_last_seconds=since_last,
+                    min_interval_seconds=min_interval,
+                )
+                return
             category = self._store.config.interceptor.category_filter or None
             # Full policy pass (reconcile, duplicates, frontier, lifecycle events).
             # Prefer the category-filtered sync snapshot so queue/frontier logic sees
@@ -1597,6 +2534,7 @@ class Interceptor:
                 completion_source="event",
                 event_batch_id=event_batch_id,
             )
+            self._last_event_policy_at = time.time()
             mcfg = self._store.config.matcher
             if mcfg.enabled and mcfg.auto_placement and mcfg.run_on_add and scoped:
                 self._schedule_auto_placement(
@@ -1728,6 +2666,7 @@ class Interceptor:
         for h in list(self._torrent_state):
             if h not in active:
                 self._torrent_state.pop(h, None)
+        self._file_stall.prune(active)
 
     async def _process_queueing_update(self, event_batch_id: int | None = None) -> None:
         await self._process_event_updates([], [], event_batch_id=event_batch_id, queueing_changed=True)
@@ -1794,6 +2733,13 @@ class Interceptor:
         age = self._stalled_seconds(t, now)
         if age < cfg.stalled_min_minutes * 60:
             return False, f"inactive for {int(age // 60)}m, below {cfg.stalled_min_minutes}m threshold"
+        stall_ok, _, stall_detail = self._offload_stall_state(t, now)
+        if not stall_ok:
+            return False, (
+                f"below stall_after threshold ({stall_detail})"
+                if stall_detail
+                else "below stall_after threshold"
+            )
         return True, "stalled long enough with weak availability"
 
     async def _recover_stalled(
@@ -1807,7 +2753,7 @@ class Interceptor:
         cfg = self._store.config.interceptor
         if not cfg.reannounce_before_debrid:
             return
-        hashes: list[str] = []
+        eligible: list[tuple[str, dict]] = []
         for torrent in torrents:
             h = torrent.get("hash", "")
             if not h or h in duplicate_hashes or _is_complete(torrent):
@@ -1820,26 +2766,35 @@ class Interceptor:
             last = float(state.get("last_reannounce_at") or 0)
             if now - last < cfg.reannounce_cooldown_minutes * 60:
                 continue
-            hashes.append(h)
-            state["last_reannounce_at"] = now
+            eligible.append((h, torrent))
+        if not eligible:
+            return
+        # Cap the burst: if thousands of cooldowns lapse at once (e.g. right
+        # after a restart, when in-memory cooldown state is fresh), reannounce
+        # them a batch at a time instead of flooding trackers/qBittorrent in
+        # one shot. The rest naturally get picked up on the following passes.
+        cap = max(1, int(cfg.max_reannounce_per_scan))
+        batch = eligible[:cap]
+        hashes = [h for h, _ in batch]
+        for h, torrent in batch:
+            self._torrent_state[h]["last_reannounce_at"] = now
             self._remember(
                 torrent,
                 "recover",
                 "stalled; forced tracker reannounce before debrid",
                 event_batch_id=event_batch_id,
             )
-        if not hashes:
-            return
         await self._qbt.add_tags(hashes, TAG_STALLED)
         await self._qbt.reannounce(hashes)
         self._stats.actions += len(hashes)
         self._emit(
             "stalled.reannounce",
-            f"Reannounced {len(hashes)} stalled torrent(s)",
+            f"Reannounced {len(hashes)} stalled torrent(s)"
+            + (f" ({len(eligible) - len(hashes)} deferred to next pass)" if len(eligible) > len(hashes) else ""),
             event_batch_id=event_batch_id,
             count=len(hashes),
         )
-        self._save_state()
+        self._mark_state_dirty()
 
     def _observe_torrents(self, torrents: list[dict], now: float) -> None:
         seen: set[str] = set()
@@ -1873,7 +2828,84 @@ class Interceptor:
         for h in list(self._torrent_state):
             if h not in seen and time.time() - float(self._torrent_state[h].get("first_seen_at", now)) > 86400:
                 self._torrent_state.pop(h, None)
-        self._save_state()
+        self._mark_state_dirty()
+
+    async def _sample_file_stalls(self, torrents: list[dict], now: float) -> None:
+        """Budgeted per-file progress sampling for stalled multi-file torrents (S5).
+
+        One ``torrents/files`` call per sampled torrent, oldest-sampled-first,
+        never a sweep of the whole library. Single-file torrents are detected
+        once and never re-sampled — their stall gate uses torrent-level
+        ``last_activity`` from the sync snapshot instead.
+        """
+        cfg = self._store.config.interceptor
+        stall_after = max(0, int(cfg.stall_after_seconds))
+        budget = max(0, int(cfg.file_stall_sample_budget_per_pass))
+        if not stall_after or not budget:
+            return
+        candidates: list[tuple[float, str, dict]] = []
+        for t in torrents:
+            h = t.get("hash", "")
+            if not h or t.get("state", "") not in STALL_CANDIDATE_STATES:
+                continue
+            if self._file_stall.is_single_file(h):
+                continue
+            last = self._file_stall.last_sampled_at(h)
+            if now - last < _FILE_STALL_SAMPLE_MIN_INTERVAL:
+                continue
+            candidates.append((last, h, t))
+        if not candidates:
+            return
+        candidates.sort(key=lambda item: item[0])
+        for _, h, t in candidates[:budget]:
+            try:
+                files = await self._qbt.files(h)
+            except Exception:
+                continue
+            if not files:
+                # Metadata not ready yet — try again on a later pass.
+                continue
+            inactive = _inactive_seconds(t, now)
+            self._file_stall.record_sample(
+                h,
+                files,
+                now=now,
+                stall_after=stall_after,
+                seed_last_progress_at=(now - inactive) if inactive > 0 else None,
+            )
+
+    def _offload_stall_state(self, t: dict, now: float) -> tuple[bool, float | None, str]:
+        """S5 offload gate: return ``(eligible, first_stalled_at, detail)``.
+
+        A multi-file torrent with ledger data is eligible when any wanted,
+        incomplete file has gone ``stall_after_seconds`` without progress.
+        Single-file (and never-sampled) torrents fall back to the same
+        torrent-level stall age the old 30m gate used, against the larger
+        threshold. ``stall_after_seconds = 0`` disables the gate.
+        """
+        cfg = self._store.config.interceptor
+        threshold = max(0, int(cfg.stall_after_seconds))
+        if threshold <= 0:
+            return True, None, ""
+        h = t.get("hash", "")
+        if h and self._file_stall.has_file_rows(h) and not self._file_stall.is_single_file(h):
+            since = self._file_stall.stalled_since(h, threshold, now)
+            if since is not None:
+                return True, since, "file ledger"
+            return False, None, "files progressed within stall_after window"
+        age = self._stalled_seconds(t, now)
+        if age >= threshold:
+            return True, now - age + threshold, "torrent inactivity"
+        return False, None, f"stalled {int(age // 60)}m of {threshold // 60}m"
+
+    def _fcfs_key(self, t: dict, now: float) -> tuple:
+        """S6 FCFS offload ordering: earliest first-stalled timestamp wins;
+        ties fall back to the existing queue-order key."""
+        _, first_stalled, _ = self._offload_stall_state(t, now)
+        return (
+            first_stalled if first_stalled is not None else float("inf"),
+            _priority_key(t, self._queueing_enabled),
+        )
 
     def _looks_stalled(self, t: dict) -> bool:
         cfg = self._store.config.interceptor
@@ -1906,10 +2938,35 @@ class Interceptor:
             log.warning("Ignoring unreadable interceptor state: %s", exc)
         return {}
 
-    def _save_state(self) -> None:
+    def _mark_state_dirty(self) -> None:
+        """Flag torrent-state as needing a flush without touching disk now.
+
+        Callers used to write the whole state file synchronously on every
+        call; on large libraries that blocked the event loop repeatedly.
+        The actual write happens later via ``_flush_state``, off-thread.
+        """
+        self._state_dirty = True
+
+    async def _flush_state(self, *, force: bool = False) -> None:
+        if self._file_stall.dirty:
+            await asyncio.to_thread(self._file_stall.save_if_dirty)
+        if not self._state_dirty:
+            return
+        now = time.time()
+        if not force and now - self._state_last_saved_at < _STATE_SAVE_MIN_INTERVAL:
+            return
+        async with self._state_save_lock:
+            if not self._state_dirty:
+                return
+            self._state_dirty = False
+            self._state_last_saved_at = now
+            snapshot = dict(self._torrent_state)
+            await asyncio.to_thread(self._write_state_file, snapshot)
+
+    def _write_state_file(self, snapshot: dict) -> None:
         try:
             tmp = self._state_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self._torrent_state, sort_keys=True))
+            tmp.write_text(json.dumps(snapshot, sort_keys=True))
             tmp.replace(self._state_path)
         except Exception as exc:  # pragma: no cover - state is helpful, not critical
             log.debug("failed to persist interceptor state: %s", exc)
@@ -2022,7 +3079,7 @@ class Interceptor:
     ) -> None:
         mcfg = self._store.config.matcher
         hash_index = self._hash_index_db()
-        roots = self._placement_search_roots(torrents)
+        roots = await self._placement_search_roots(torrents)
         if not roots:
             self._emit(
                 "placement.pass.skipped",
@@ -2076,6 +3133,7 @@ class Interceptor:
                     reason="files_api",
                 )
                 skips += 1
+                self._record_placement_outcome(h, placed=False, skip_reason=f"files_api: {exc}")
                 continue
             if not files_raw:
                 # On-add may fire before metadata is ready — defer silently.
@@ -2136,6 +3194,7 @@ class Interceptor:
 
             results = await asyncio.to_thread(apply_placement_plan, plan)
             placed = False
+            torrent_skip_reason = ""
             for action in results:
                 if action.kind == "move":
                     moves += 1
@@ -2161,6 +3220,7 @@ class Interceptor:
                     )
                 elif action.kind == "skip":
                     skips += 1
+                    torrent_skip_reason = str(action.reason)
                     self._emit(
                         "placement.skip",
                         f"Skipped {action.torrent_file}: {action.reason}",
@@ -2169,6 +3229,7 @@ class Interceptor:
                         reason=action.reason,
                         file=action.torrent_file,
                     )
+            self._record_placement_outcome(h, placed=placed, skip_reason=torrent_skip_reason)
             if placed and mcfg.recheck and rechecks < budget_recheck:
                 try:
                     await self._qbt.recheck(h)
@@ -2202,36 +3263,44 @@ class Interceptor:
             considered=considered,
         )
 
-    def _placement_search_roots(self, torrents: list[dict]) -> list[Path]:
+    async def _placement_search_roots(self, torrents: list[dict]) -> list[Path]:
+        # torrents can number in the thousands, but they typically share a
+        # handful of distinct save paths (one per category). Dedupe on the
+        # raw string *before* paying for Path.resolve() — a real filesystem
+        # syscall — instead of resolving every torrent's path unconditionally.
+        # The resolve loop itself still runs off-thread since it's still a
+        # blocking syscall per unique path.
+        raw_paths: list[tuple[str, bool]] = []  # (raw, is_content_path)
+        seen_raw: set[str] = set()
+        for raw in self._store.config.matcher.folders:
+            raw = (raw or "").strip()
+            if raw and raw not in seen_raw:
+                seen_raw.add(raw)
+                raw_paths.append((raw, False))
+        for t in torrents:
+            for key_name in ("save_path", "content_path"):
+                raw = (t.get(key_name) or "").strip()
+                if raw and raw not in seen_raw:
+                    seen_raw.add(raw)
+                    raw_paths.append((raw, key_name == "content_path"))
+        return await asyncio.to_thread(self._resolve_placement_roots, raw_paths)
+
+    @staticmethod
+    def _resolve_placement_roots(raw_paths: list[tuple[str, bool]]) -> list[Path]:
         roots: list[Path] = []
         seen: set[str] = set()
-        for raw in self._store.config.matcher.folders:
-            if not (raw or "").strip():
-                continue
+        for raw, is_content_path in raw_paths:
             try:
                 p = Path(raw).expanduser().resolve()
             except OSError:
                 continue
+            # Prefer parent of content_path (often the file itself).
+            if is_content_path and p.is_file():
+                p = p.parent
             key = str(p)
             if key not in seen:
                 seen.add(key)
                 roots.append(p)
-        for t in torrents:
-            for key_name in ("save_path", "content_path"):
-                raw = (t.get(key_name) or "").strip()
-                if not raw:
-                    continue
-                try:
-                    p = Path(raw).expanduser().resolve()
-                except OSError:
-                    continue
-                # Prefer parent of content_path (often the file itself).
-                if key_name == "content_path" and p.is_file():
-                    p = p.parent
-                key = str(p)
-                if key not in seen:
-                    seen.add(key)
-                    roots.append(p)
         return roots
 
     def _maybe_placement_after_debrid(
@@ -2284,6 +3353,14 @@ class Interceptor:
         self._stats.qbt_retry_after = 0
         if was_offline:
             self._emit("qbt.online", "qBittorrent connection restored")
+
+    def _qbt_recently_ok(self) -> bool:
+        """True when a qBittorrent call succeeded within ~3 sync polls."""
+        window = max(1, self._store.config.interceptor.sync_poll_seconds) * 3
+        return (
+            self._stats.qbt_online is True
+            and time.time() - self._stats.last_qbt_success_at <= window
+        )
 
     def _mark_qbt_error(self, exc: Exception) -> None:
         now = time.time()
@@ -2419,6 +3496,12 @@ class Interceptor:
             await self._qbt.delete(hashes, delete_files=False)
             action = "deleted"
         elif cfg.action == "pause":
+            # Intentionally permanent: unlike the pause/resume flows the
+            # interceptor uses mid-workflow, "pause" here means "this is a
+            # losing duplicate, stop wasting bandwidth on it" -- there is no
+            # automatic resume path, and there should not be one. Exempted
+            # from the pause/resume-parity audit (see docs/plans/
+            # 2026-07-29-001-fix-active-download-manager-plan.md, U4).
             await self._qbt.pause(hashes)
             action = "paused"
         else:
@@ -2669,10 +3752,14 @@ class Interceptor:
             )
 
             magnet = _magnet_for(t)
+            # S4: per-file selection — only files qBittorrent still wants
+            # (priority > 0) and lacks (progress < 1) are fetched/served.
+            wanted = await self._wanted_files(h)
             result = await self._debrid.resolve(
                 magnet,
                 max_wait_seconds=cfg.max_wait_minutes * 60,
                 poll_seconds=self._store.config.interceptor.poll_seconds,
+                wanted_files=wanted,
             )
 
             if cfg.delivery_mode == "webseed":
@@ -2708,8 +3795,10 @@ class Interceptor:
                     provider=result.provider,
                     urls=len(urls),
                 )
-                await self._qbt.add_webseeds(h, urls)
+                await self._add_webseeds(h, urls)
                 injected_urls = urls
+                # S8: never let the webseed handoff turn into seeding.
+                await self._apply_download_only_limits([h])
                 await self._qbt.resume(h)
                 await self._qbt.add_tags(h, f"{TAG_DONE},{TAG_WEBSEED}")
                 await self._qbt.remove_tags(h, TAG_ACTIVE)
@@ -2718,6 +3807,8 @@ class Interceptor:
                     add={TAG_DONE, TAG_WEBSEED},
                     remove={TAG_ACTIVE, TAG_CANDIDATE},
                 )
+                self._torrent_state.setdefault(h, {})["webseed_urls"] = urls
+                self._mark_state_dirty()
                 self._stats.actions += 1
                 self._emit(
                     "intercept.done",
@@ -2777,17 +3868,24 @@ class Interceptor:
                 self._maybe_placement_after_debrid(t, event_batch_id=event_batch_id)
                 if cfg.remove_original:
                     await self._qbt.delete(h, delete_files=False)
+                else:
+                    # Unlike the webseed branch, this path has no HTTP source
+                    # injected into qBittorrent to resume downloading from —
+                    # the file is already on disk via _mirror_downloads. Resume
+                    # anyway so the original torrent isn't left paused forever
+                    # when the operator keeps it around instead of deleting it.
+                    await self._qbt.resume(h)
         except DebridError as exc:
             if injected_urls:
                 try:
-                    await self._qbt.remove_webseeds(h, injected_urls)
+                    await self._remove_webseeds(h, injected_urls)
                 except Exception:  # pragma: no cover - best-effort cleanup
                     log.debug("failed to remove webseeds after debrid error", exc_info=True)
             await self._on_failure(h, name, str(exc), event_batch_id=event_batch_id)
         except Exception as exc:  # pragma: no cover - unexpected
             if injected_urls:
                 try:
-                    await self._qbt.remove_webseeds(h, injected_urls)
+                    await self._remove_webseeds(h, injected_urls)
                 except Exception:
                     log.debug("failed to remove webseeds after error", exc_info=True)
             await self._on_failure(h, name, repr(exc), event_batch_id=event_batch_id)
@@ -2858,6 +3956,8 @@ class Interceptor:
     ) -> None:
         cfg = self._store.config.interceptor
         log.warning("debrid intercept failed for %s: %s", name, error)
+        self._torrent_state.setdefault(h, {})["last_error_reason"] = str(error)
+        self._mark_state_dirty()
         try:
             await self._qbt.add_tags(h, TAG_FAILED)
             await self._qbt.remove_tags(h, TAG_ACTIVE)
